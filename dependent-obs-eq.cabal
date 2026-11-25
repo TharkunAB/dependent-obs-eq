@@ -1,0 +1,61 @@
+cabal-version: 3.4
+name: dependent-obs-eq
+version: 0.1.0.0
+synopsis: Observational-equivalence typechecker plugin for Dependent Haskell
+description:
+  @dependent-obs-eq@ provides a GHC typechecker plugin ('Dependent.Plugin.ObsEq')
+  and user combinator library ('Dependent.ObsEq') that test and discharge
+  observational type equalities in Dependent Haskell (@-XDependentTypes@).
+  .
+  The plugin evaluates open type-level expressions over generated total and
+  partially defined ('ObsBottom') inputs, compares bounded constructor trees up
+  to a configurable Kleene approximation depth with per-sample microsecond
+  timeouts, shrinks falsifying inputs to minimal counterexamples, and discharges
+  explicit observational witnesses ('obsEq', 'obsEqWith', 'obsEqGen').
+  .
+  Based on the observational-equivalence / QuickCheck @TcPlugin@ idea proposed
+  by Jules (\@analytichegel).
+
+homepage: https://github.com/TharkunAB/dependent-obs-eq
+bug-reports: https://github.com/TharkunAB/dependent-obs-eq/issues
+license: BSD-3-Clause
+license-file: LICENSE
+author: Matthias Pall Gissurarson
+maintainer: mpg@mpg.is
+copyright: 2026 Tharkun AB and Matthias Pall Gissurarson
+category: Dependent Types, Compiler Plugins, Testing
+build-type: Simple
+extra-doc-files:
+  CHANGELOG.md
+  README.md
+
+source-repository head
+  type: git
+  location: https://github.com/TharkunAB/dependent-obs-eq.git
+
+common warnings
+  ghc-options: -Wall
+  default-language: GHC2024
+
+library
+  import: warnings
+  hs-source-dirs: src
+  exposed-modules:
+    Dependent.ObsEq
+    Dependent.Plugin.ObsEq
+
+  build-depends:
+    base >=4.20 && <5,
+    containers >=0.6 && <0.9,
+    ghc >=10.1 && <10.3,
+    time >=1.12 && <2,
+
+test-suite dependent-obs-eq-test
+  import: warnings
+  type: exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is: Main.hs
+  build-depends:
+    base,
+    dependent-obs-eq,
+    ghc-experimental,
