@@ -44,6 +44,9 @@ library
     Dependent.ObsEq
     Dependent.Plugin.ObsEq
 
+  other-modules:
+    Dependent.Plugin.ObsEq.Rewrite
+
   build-depends:
     base >=4.20 && <5,
     containers >=0.6 && <0.9,

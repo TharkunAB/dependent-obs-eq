@@ -81,6 +81,8 @@ module Dependent.ObsEq
   , adtShow
   , mkAdtObsDict
   , evalObsVerdict
+  , hashObsTree
+  , evalSideFingerprints
   , renderInconclusiveReason
   , runObsTestLoop
   , obsPureGen
@@ -1137,6 +1139,60 @@ mkAdtObsDict baseGens totalCons partialCons rawShrink rawApprox rawShow =
                     Just (ObsBottom tag) -> pure ("<bottom#" ++ show tag ++ ">")
                     Nothing -> pure "<exception>"
 
+-- | Compute a 64-bit FNV-1a fingerprint of a finite 'ObsTree', returning @0@
+-- when any node hits a resource cutoff, timeout, or synchronous exception.
+hashObsTree :: ObsTree -> Word64
+hashObsTree = go 0xcbf29ce484222325
+  where
+    step :: Word64 -> Word64 -> Word64
+    step h b = (h `xor` b) * 0x100000001b3
+
+    hashBytes :: Word64 -> String -> Word64
+    hashBytes = foldl (\h c -> step h (fromIntegral (ord c)))
+
+    go :: Word64 -> ObsTree -> Word64
+    go h (ObsCon nm children) =
+      let h1 = step (hashBytes (step h 1) nm) (fromIntegral (length children))
+       in foldMTree h1 children
+    go h (ObsRaisedBottom tag) =
+      let r = step (step h 2) (fromIntegral tag)
+       in if r == 0 then 1 else r
+    go _ ObsCutoff = 0
+    go _ ObsTimedOut = 0
+    go _ ObsRaisedSyncError = 0
+
+    foldMTree :: Word64 -> [ObsTree] -> Word64
+    foldMTree acc [] = if acc == 0 then 1 else acc
+    foldMTree acc (t : ts) =
+      let h' = go acc t
+       in if h' == 0 then 0 else foldMTree h' ts
+
+-- | Evaluate 8 Tier-0 probe fingerprints for an open expression side so
+-- multi-obligation modules can screen disequalities across shared subterms.
+evalSideFingerprints
+  :: forall env r.
+     ObsConfig
+  -> (Int -> Gen env)
+  -> (Int -> r -> IO ObsTree)
+  -> (env -> r)
+  -> IO String
+evalSideFingerprints cfg mkEnvGen approxR evalSide = do
+  let maxSz = max 0 (fromIntegral (obsMaxSize cfg) :: Int)
+      partPct = min 100 (max 0 (fromIntegral (obsPartialPct cfg) :: Int))
+      tmoUs = min 1000 (max 1 (fromIntegral (obsTimeoutUs cfg) :: Int))
+      seed0 = fromIntegral (obsSeed cfg) :: Word64
+      totalGen = mkEnvGen 0
+      partialGen = mkEnvGen partPct
+      probeOne idx = do
+        let sz = sampleScheduleSize idx 8 maxSz
+            usePartial = partPct > 0 && idx >= 5 && ((idx * 37 + 13) `rem` 100 < partPct)
+            baseGen = if usePartial then partialGen else totalGen
+            env = runGenAt seed0 idx sz (applyAxisProbe idx sz baseGen)
+        t <- evalObsSample tmoUs approxR 4 (evalSide env)
+        pure (hashObsTree t)
+  hashes <- mapM probeOne [0 .. 7]
+  pure (unwords (map show hashes))
+
 -- | Compute the three-valued 'ObsVerdict' across the configured sample schedule.
 evalObsVerdict
   :: forall env r.
@@ -1247,10 +1303,8 @@ integerCubeRoot n
 applyAxisProbe :: Int -> Int -> Gen a -> Gen a
 applyAxisProbe idx sz (Gen g)
   | idx >= 1 && idx <= 4 = Gen $ \s _ ->
-      let (s1, s2) = splitSeed s
-          (w, _) = stepSeed s1
+      let (_, s2) = splitSeed s
           probeSz = if even idx then max 1 sz else 0
-          _ = w
        in g s2 probeSz
   | otherwise = Gen g
 

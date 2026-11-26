@@ -21,7 +21,6 @@ module Dependent.Plugin.ObsEq
   , parsePluginOpts
   ) where
 
-import Control.Applicative ( (<|>) )
 import Control.Monad ( foldM, forM, guard, when, zipWithM )
 import Data.Char ( isSpace )
 import Data.IORef ( IORef, newIORef, readIORef, writeIORef )
@@ -31,6 +30,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe ( catMaybes, isJust, isNothing, mapMaybe )
 import qualified Data.Set as Set
 import Data.Time.Clock ( getCurrentTime )
+import Data.Word ( Word64 )
 import Numeric.Natural ( Natural )
 import Text.Read ( readMaybe )
 
@@ -40,11 +40,35 @@ import Dependent.ObsEq
   , defaultObsConfig
   , renderInconclusiveReason
   )
+import Dependent.Plugin.ObsEq.Rewrite
+  ( KBEnv
+  , buildKBEnv
+  , normalizeTypeKB
+  , proveGoalConstructively
+  )
 
 import GHC.Builtin.Modules ( mkInteractiveModule )
 import qualified GHC.ByteCode.Serialize as ByteCode
 import GHC.Core.Class ( Class, classMethods, classTyCon )
+import GHC.Core.Coercion.Axiom
+  ( closedTyFamCoAxiom_maybe
+  , coAxBranchLHS
+  , coAxBranchRHS
+  , coAxBranchTyVars
+  , coAxiomBranches
+  , fromBranches
+  )
 import GHC.Core.InstEnv ( InstEnvs, instanceDFunId, lookupUniqueInstEnv )
+import GHC.Core.Map.Type
+  ( TypeMap
+  , emptyCME
+  , emptyTypeMap
+  , extendCMEs
+  , extendTypeMap
+  , extendTypeMapWithScope
+  , lookupTypeMap
+  , lookupTypeMapWithScope
+  )
 import GHC.Core.Multiplicity ( scaledThing )
 import GHC.Core.Predicate
   ( EqRel (NomEq)
@@ -91,14 +115,13 @@ import GHC.Tc.Types
   )
 import GHC.Tc.Types.Constraint
   ( Ct
-  , ctEvCoercion
-  , ctEvidence
   , ctLoc
   , ctPred
   , insolubleCt
   )
-import GHC.Tc.Types.CtLoc ( ctLocSpan )
+import GHC.Tc.Types.CtLoc ( ctLocOrigin, ctLocSpan )
 import GHC.Tc.Types.Evidence ( EvBindsVar, EvTerm (EvExpr), evCoercion )
+import GHC.Tc.Types.Origin ( CtOrigin (ExprHoleOrigin) )
 import GHC.Tc.Utils.Env
   ( tcGetInstEnvs
   , tcLookupClass
@@ -284,11 +307,16 @@ plugin =
     , pluginRecompile = flagRecompile
     }
 
+type VerdictCacheKey = (ObsConfig, Bool)
+
 data PluginState = PluginState
   { psOpts :: !PluginOpts
   , psOptErr :: !(Maybe String)
   , psCachedEnv :: !(IORef (Maybe CachedObsEnv))
   , psReportedSpans :: !(IORef (Set.Set (String, String)))
+  , psDesugarCache :: !(IORef (Maybe (Module, Int, NameEnv (Id, CoreExpr))))
+  , psVerdictCache :: !(IORef (Map.Map VerdictCacheKey (TypeMap (TypeMap ObsCheckOutcome))))
+  , psSideCache :: !(IORef (Map.Map ObsConfig (TypeMap [Word64])))
   }
 
 data CachedObsEnv = CachedObsEnv
@@ -298,6 +326,7 @@ data CachedObsEnv = CachedObsEnv
   , ceObsGenCls :: !Class
   , ceTyEqTc :: !TyCon
   , ceReflDc :: !DataCon
+  , ceOrderingTc :: !TyCon
   , ceObsConfigTc :: !TyCon
   , ceObsConfigDc :: !DataCon
   , ceObsTreeTc :: !TyCon
@@ -315,6 +344,7 @@ data CachedObsEnv = CachedObsEnv
   , ceAdtApproxId :: !Id
   , ceAdtShowId :: !Id
   , ceRunLoopId :: !Id
+  , ceEvalSideFpId :: !Id
   , cePureGenId :: !Id
   , ceApGenId :: !Id
   , cePureIOId :: !Id
@@ -335,12 +365,18 @@ initPluginState rawOpts = do
         Left err -> (defaultPluginOpts, Just err)
   envRef <- tcPluginIO (newIORef Nothing)
   repRef <- tcPluginIO (newIORef Set.empty)
+  dsRef <- tcPluginIO (newIORef Nothing)
+  vcRef <- tcPluginIO (newIORef Map.empty)
+  scRef <- tcPluginIO (newIORef Map.empty)
   pure
     PluginState
       { psOpts = parsedOpts
       , psOptErr = optErr
       , psCachedEnv = envRef
       , psReportedSpans = repRef
+      , psDesugarCache = dsRef
+      , psVerdictCache = vcRef
+      , psSideCache = scRef
       }
 
 getCachedObsEnv :: PluginState -> TcPluginM (Maybe CachedObsEnv)
@@ -353,6 +389,7 @@ getCachedObsEnv st = do
       case obsFind of
         Finder.Found _ obsMod -> do
           let eqMod = mkModule (stringToUnit "ghc-internal") (mkModuleName "GHC.Internal.Data.Type.Equality")
+              typesMod = mkModule (stringToUnit "ghc-internal") (mkModuleName "GHC.Internal.Types")
           env <- unsafeTcPluginTcM $ do
             obsEqCls <- lookupOrig obsMod (mkTcOcc "ObsEq") >>= tcLookupClass
             obsEqWithCls <- lookupOrig obsMod (mkTcOcc "ObsEqWith") >>= tcLookupClass
@@ -360,6 +397,7 @@ getCachedObsEnv st = do
             obsGenCls <- lookupOrig obsMod (mkTcOcc "ObsGen") >>= tcLookupClass
             tyEqTc <- lookupOrig eqMod (mkTcOcc ":~:") >>= tcLookupTyCon
             reflDc <- lookupOrig eqMod (mkDataOcc "Refl") >>= tcLookupDataCon
+            orderingTc <- lookupOrig typesMod (mkTcOcc "Ordering") >>= tcLookupTyCon
             obsConfigTc <- lookupOrig obsMod (mkTcOcc "ObsConfig") >>= tcLookupTyCon
             obsConfigDc <- lookupOrig obsMod (mkDataOcc "ObsConfig") >>= tcLookupDataCon
             obsTreeTc <- lookupOrig obsMod (mkTcOcc "ObsTree") >>= tcLookupTyCon
@@ -377,6 +415,7 @@ getCachedObsEnv st = do
             adtApproxId <- lookupOrig obsMod (mkVarOcc "adtApprox") >>= tcLookupId
             adtShowId <- lookupOrig obsMod (mkVarOcc "adtShow") >>= tcLookupId
             runLoopId <- lookupOrig obsMod (mkVarOcc "runObsTestLoop") >>= tcLookupId
+            evalSideFpId <- lookupOrig obsMod (mkVarOcc "evalSideFingerprints") >>= tcLookupId
             pureGenId <- lookupOrig obsMod (mkVarOcc "obsPureGen") >>= tcLookupId
             apGenId <- lookupOrig obsMod (mkVarOcc "obsApGen") >>= tcLookupId
             pureIOId <- lookupOrig obsMod (mkVarOcc "obsPureIO") >>= tcLookupId
@@ -396,6 +435,7 @@ getCachedObsEnv st = do
                 , ceObsGenCls = obsGenCls
                 , ceTyEqTc = tyEqTc
                 , ceReflDc = reflDc
+                , ceOrderingTc = orderingTc
                 , ceObsConfigTc = obsConfigTc
                 , ceObsConfigDc = obsConfigDc
                 , ceObsTreeTc = obsTreeTc
@@ -413,6 +453,7 @@ getCachedObsEnv st = do
                 , ceAdtApproxId = adtApproxId
                 , ceAdtShowId = adtShowId
                 , ceRunLoopId = runLoopId
+                , ceEvalSideFpId = evalSideFpId
                 , cePureGenId = pureGenId
                 , ceApGenId = apGenId
                 , cePureIOId = pureIOId
@@ -447,6 +488,41 @@ data CandidateGoal
       , cgOrigRhs :: !Type
       }
 
+{- Note [Speculative ExprHoleOrigin isolation and polymorphic dictionaries]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. Speculative hole-fit isolation ('isSpeculativeHoleCt'):
+   GHC's 'tcCheckHoleFit' wraps candidate checks inside 'discardErrs' and tags
+   subtype constraints with 'ExprHoleOrigin'. 'discardErrs' rolls back compiler
+   error messages, not plugin 'IORef's or 'tcg_source_check'. When
+   'isSpeculativeHoleCt' is 'True':
+   * Under 'RefuteOnly' and 'ExplicitOnly', 'BareNominalGoal' skips bytecode
+     testing immediately because 'ExplicitOnly' never discharges bare nominal
+     equalities and 'discardErrs' discards counterexample diagnostics.
+   * For 'ExplicitDictGoal' (checking whether 'obsEq' itself fits a typed hole),
+     the plugin runs 'runObservationalCheck' without mutating 'psReportedSpans',
+     'tcg_source_check', or 'recordThNeededRuntimeDeps', and returns
+     'TcPluginContradiction' on both 'ObsCheckRefuted' and
+     'ObsCheckInconclusive' so GHC suggests 'obsEq' only when the goal verifies.
+
+2. Polymorphic skolem specialization and dictionary preservation:
+   Unconstrained parametric 'Type' skolems specialize to 'Ordering' (and unary
+   type-constructor skolems @Type -> Type@ specialize to @[]@ for refutation).
+   Before applying 'polySubst', 'detectPolyClassConstraint' inspects every
+   'ClassAppTy' node and every function's invisible 'Anon' class predicates.
+   When a class constraint mentions a skolem type variable:
+   * Refutation stays enabled (using global coherent instances at 'Ordering' or
+     fallback 'Int' to find concrete counterexamples).
+   * Positive discharge is blocked: 'ObsCheckVerified' maps to
+     @ObsCheckInconclusive (PolymorphicClassConstraint predStr)@, because
+     agreement on one monomorphic instance cannot prove arbitrary user instances.
+-}
+
+isSpeculativeHoleCt :: Ct -> Bool
+isSpeculativeHoleCt ct =
+  case ctLocOrigin (ctLoc ct) of
+    ExprHoleOrigin _ -> True
+    _ -> False
+
 solveObsEq :: PluginState -> EvBindsVar -> [Ct] -> [Ct] -> TcPluginM TcPluginSolveResult
 solveObsEq st _evBinds givens wanteds
   | null wanteds = pure (TcPluginOk [] [])
@@ -463,12 +539,24 @@ solveObsEq st _evBinds givens wanteds
       case mbEnv of
         Nothing -> pure (TcPluginOk [] [])
         Just cenv -> do
-          let givenRewrites = extractGivenRewrites givens
-              candidates = mapMaybe (classifyWanted cenv) wanteds
+          let candidates = mapMaybe (classifyWanted cenv) wanteds
           if null candidates
             then pure (TcPluginOk [] [])
             else do
-              outcomes <- forM candidates (evaluateGoal st cenv givenRewrites)
+              let goalTys = concat [[cgOrigLhs g, cgOrigRhs g] | g <- candidates]
+                  kbEnv = buildKBEnv givens goalTys
+              adtCacheRef <- tcPluginIO (newIORef emptyTypeMap)
+              prepared <- forM candidates (prepareGoal st cenv kbEnv adtCacheRef)
+              let tasks = [t | PreparedTask t <- prepared]
+              batchOuts <-
+                case tasks of
+                  [] -> pure (Just [])
+                  t0 : _ ->
+                    let locSpan = pbtLocSpan t0
+                        anyReal = any (not . pbtSpeculative) tasks
+                     in unsafeTcPluginTcM $
+                          runCoreIOStringBatch st cenv locSpan anyReal (map pbtBatchIo tasks)
+              outcomes <- finalizePreparedGoals st cenv prepared batchOuts
               let bads = [ct | Left ct <- outcomes]
                   solved = [pair | Right (Just pair) <- outcomes]
               if not (null bads)
@@ -543,70 +631,6 @@ classifyWanted cenv ct
     validPromotedKind k =
       not (tcIsLiftedTypeKind k) && tcIsLiftedTypeKind (typeKind k)
 
--- ---------------------------------------------------------------------------
--- Given Nominal Equality Substitution
--- ---------------------------------------------------------------------------
-
-data GivenRewrite = GivenRewrite
-  { grVar :: !Var
-  , grTarget :: !Type
-  , grCo :: !Coercion
-  }
-
-extractGivenRewrites :: [Ct] -> [GivenRewrite]
-extractGivenRewrites = mapMaybe toRewrite
-  where
-    toRewrite ct =
-      case classifyPredType (ctPred ct) of
-        EqPred NomEq lhs rhs ->
-          let co = ctEvCoercion (ctEvidence ct)
-           in orient lhs rhs co <|> orient rhs lhs (mkSymCo co)
-        _ -> Nothing
-
-    orient side other co =
-      case coreFullView side of
-        TermVarTy v
-          | not (occursVar v other) ->
-              Just (GivenRewrite v other co)
-        TyVarTy tv
-          | not (occursVar tv other) ->
-              Just (GivenRewrite tv other co)
-        _ -> Nothing
-
-    occursVar v ty = v `elem` collectFreeTermAndTyVars [ty]
-
-applyGivenRewrites :: [GivenRewrite] -> Type -> (Type, [Coercion])
-applyGivenRewrites [] ty = (ty, [])
-applyGivenRewrites rewrites ty0 = go (8 :: Int) ty0 []
-  where
-    rwMap = listToUFM [(grVar r, r) | r <- rewrites]
-
-    go 0 cur acc = (cur, acc)
-    go fuel cur acc =
-      let (next, used) = step cur
-       in if null used
-            then (cur, acc)
-            else go (fuel - 1) next (used ++ acc)
-
-    step ty =
-      case coreFullView ty of
-        TermVarTy v
-          | Just r <- lookupUFM rwMap v
-          , varType v `tcEqType` typeKind (grTarget r) ->
-              (grTarget r, [grCo r])
-        TyVarTy tv
-          | Just r <- lookupUFM rwMap tv
-          , tyVarKind tv `tcEqType` typeKind (grTarget r) ->
-              (grTarget r, [grCo r])
-        TyConApp tc args ->
-          let (args', coList) = unzip (map step args)
-           in (mkTyConApp tc args', concat coList)
-        AppTy f a ->
-          let (f', c1) = step f
-              (a', c2) = step a
-           in (mkAppTy f' a', c1 ++ c2)
-        _ -> (ty, [])
-
 collectFreeTermAndTyVars :: [Type] -> [Var]
 collectFreeTermAndTyVars tys =
   nubBy (\a b -> getUnique a == getUnique b) (concatMap walk tys)
@@ -614,102 +638,340 @@ collectFreeTermAndTyVars tys =
     walk ty =
       case coreFullView ty of
         TermVarTy v -> walk (varType v) ++ [v]
+        TermAppTy f arg -> walk (varType f) ++ [f] ++ walk arg
         TyVarTy tv -> walk (tyVarKind tv) ++ [tv]
         TyConApp _ args -> concatMap walk args
         AppTy f a -> walk f ++ walk a
-        FunTy _ _ _ a r -> walk a ++ walk r
-        ForAllTy _ b r ->
-          filter (/= binderVar b) (walk (varType (binderVar b)) ++ walk r)
+        FunTy _ ma mult a r -> walk ma ++ walk mult ++ walk a ++ walk r
+        ForAllTy ma b r ->
+          walk ma
+            ++ filter (/= binderVar b) (walk (varType (binderVar b)) ++ walk r)
         CastTy t _ -> walk t
+        ClassAppTy _ i d x k -> walk i ++ walk d ++ walk x ++ walk k
+        DepFunTy _ b r ->
+          walk (varType b) ++ filter (/= b) (walk r)
+        DepDictTy b r ->
+          walk (varType b) ++ filter (/= b) (walk r)
+        ExistsTy _ tv r ->
+          walk (tyVarKind tv) ++ filter (/= tv) (walk r)
         _ -> []
 
 -- ---------------------------------------------------------------------------
--- Evaluating a Candidate Goal
+-- Preparing, Caching, and Finalizing Candidate Goals
 -- ---------------------------------------------------------------------------
 
-evaluateGoal
+data PreparedGoal
+  = PreparedDone !(Either Ct (Maybe (EvTerm, Ct)))
+  | PreparedTask !PreparedBcoTask
+
+data PreparedBcoTask = PreparedBcoTask
+  { pbtGoal :: !CandidateGoal
+  , pbtLocSpan :: !SrcSpan
+  , pbtSpeculative :: !Bool
+  , pbtUsedGivenCos :: ![Coercion]
+  , pbtHasPolyDict :: !(Maybe String)
+  , pbtCacheInfo :: !(Maybe (VerdictCacheKey, [Var], Type, Type))
+  , pbtSideProbeInfo :: !(Maybe (ObsConfig, [Var], Type, Type))
+  , pbtBatchIo :: !CoreExpr
+  }
+
+prepareGoal
   :: PluginState
   -> CachedObsEnv
-  -> [GivenRewrite]
+  -> KBEnv
+  -> IORef AdtCache
   -> CandidateGoal
-  -> TcPluginM (Either Ct (Maybe (EvTerm, Ct)))
-evaluateGoal st cenv rewrites goal = do
+  -> TcPluginM PreparedGoal
+prepareGoal st cenv kbEnv adtCacheRef goal = do
   let ct = cgCt goal
+      speculative = isSpeculativeHoleCt ct
       locSpan = RealSrcSpan (ctLocSpan (ctLoc ct)) Strict.Nothing
       origLhs = cgOrigLhs goal
       origRhs = cgOrigRhs goal
-      (lhsSub, cosL) = applyGivenRewrites rewrites origLhs
-      (rhsSub, cosR) = applyGivenRewrites rewrites origRhs
-      usedGivenCos = cosL ++ cosR
 
-  if lhsSub `tcEqType` rhsSub
-    then
+  -- Step 1: Zero-UnivCo constructive KBO check (valid under all policies!)
+  case proveGoalConstructively kbEnv origLhs origRhs of
+    Just constructiveCo -> do
       case goal of
-        ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} ->
-          case poPolicy (psOpts st) of
-            RefuteOnly -> pure (Right Nothing)
-            _ -> do
-              let co = mkPluginUnivCo usedGivenCos origLhs origRhs
-                  ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs co
-              pure (Right (Just (ev, ct)))
+        ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} -> do
+          let ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs constructiveCo
+          pure (PreparedDone (Right (Just (ev, ct))))
         BareNominalGoal {} ->
-          case poPolicy (psOpts st) of
-            RefuteOnly -> pure (Right Nothing)
-            ExplicitOnly -> pure (Right Nothing)
-            ImplicitAssume -> do
-              let co = mkPluginUnivCo usedGivenCos origLhs origRhs
-              pure (Right (Just (evCoercion co, ct)))
-    else do
-      mbCfg <- case cgCfgGoal goal of
-        Nothing -> pure (Just (poConfig (psOpts st)))
-        Just cfgTy -> unsafeTcPluginTcM (evalObsConfigType cenv locSpan cfgTy)
-      case mbCfg of
-        Nothing -> pure (Right Nothing)
-        Just cfg -> do
-          mbResult <- unsafeTcPluginTcM $
-            runObservationalCheck cenv locSpan cfg (cgGenGoal goal) (cgKind goal) lhsSub rhsSub
-          case mbResult of
-            Nothing -> pure (Right Nothing)
-            Just (ObsCheckRefuted counterexample) -> do
-              emitCounterexampleOnce st locSpan origLhs origRhs counterexample
-              pure (Left ct)
-            Just (ObsCheckInconclusive reason) -> do
-              case (poPolicy (psOpts st), goal) of
-                (RefuteOnly, _) -> pure (Right Nothing)
-                (_, ExplicitDictGoal {}) -> do
-                  emitInconclusiveOnce st locSpan origLhs origRhs (renderInconclusiveReason reason)
-                  pure (Right Nothing)
-                (_, BareNominalGoal {}) -> pure (Right Nothing)
-            Just ObsCheckVerified ->
-              case poPolicy (psOpts st) of
-                RefuteOnly -> pure (Right Nothing)
-                ExplicitOnly ->
-                  case goal of
-                    ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} -> do
-                      tcPluginTrace "dependent-obs-eq: discharged explicit goal" (ppr (ctPred ct))
-                      let co = mkPluginUnivCo usedGivenCos origLhs origRhs
-                          ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs co
-                      pure (Right (Just (ev, ct)))
-                    BareNominalGoal {} -> pure (Right Nothing)
-                ImplicitAssume -> do
-                  let co = mkPluginUnivCo usedGivenCos origLhs origRhs
-                  case goal of
-                    ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} -> do
-                      tcPluginTrace "dependent-obs-eq: discharged explicit goal" (ppr (ctPred ct))
-                      let ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs co
-                      pure (Right (Just (ev, ct)))
-                    BareNominalGoal {} -> do
-                      tcPluginTrace "dependent-obs-eq: implicitly assumed nominal equality" (ppr (ctPred ct))
-                      when (poWarnAssume (psOpts st)) $
-                        emitCounterexampleOnce st locSpan origLhs origRhs
-                          "Note: assumed via policy=assume"
-                      pure (Right (Just (evCoercion co, ct)))
+          pure (PreparedDone (Right (Just (evCoercion constructiveCo, ct))))
+    Nothing -> do
+      -- Step 2: Speculative ExprHoleOrigin fast skip on BareNominalGoal
+      case (speculative, goal, poPolicy (psOpts st)) of
+        (True, BareNominalGoal {}, RefuteOnly) -> pure (PreparedDone (Right Nothing))
+        (True, BareNominalGoal {}, ExplicitOnly) -> pure (PreparedDone (Right Nothing))
+        _ -> do
+          let (lhsSub, _, cosL) = normalizeTypeKB kbEnv origLhs
+              (rhsSub, _, cosR) = normalizeTypeKB kbEnv origRhs
+              usedGivenCos = cosL ++ cosR
+
+          mbCfg <- case cgCfgGoal goal of
+            Nothing -> pure (Just (poConfig (psOpts st)))
+            Just cfgTy -> unsafeTcPluginTcM (evalObsConfigType st cenv locSpan speculative cfgTy)
+          case mbCfg of
+            Nothing -> pure (PreparedDone (Right Nothing))
+            Just cfg -> do
+              let mbGen = cgGenGoal goal
+                  canonVars = collectValueVars [lhsSub, rhsSub]
+                  cacheKey = (cfg, isJust mbGen)
+                  canCache = isNothing mbGen
+              mbCached <-
+                if canCache
+                  then lookupCachedVerdict st cacheKey canonVars lhsSub rhsSub
+                  else pure Nothing
+              case mbCached of
+                Just cachedOutcome -> do
+                  res <- applyVerdictToGoal st cenv goal locSpan speculative usedGivenCos cachedOutcome
+                  pure (PreparedDone res)
+                Nothing -> do
+                  mbBuilt <- unsafeTcPluginTcM $
+                    buildGoalBcoTask st cenv adtCacheRef cfg mbGen (cgKind goal) lhsSub rhsSub
+                  case mbBuilt of
+                    Nothing -> pure (PreparedDone (Right Nothing))
+                    Just (batchIo, hasPolyDict, needSideProbes) ->
+                      let cacheInfo =
+                            if canCache
+                              then Just (cacheKey, canonVars, lhsSub, rhsSub)
+                              else Nothing
+                          sideInfo =
+                            if needSideProbes && canCache
+                              then Just (cfg, canonVars, lhsSub, rhsSub)
+                              else Nothing
+                       in pure $
+                            PreparedTask
+                              PreparedBcoTask
+                                { pbtGoal = goal
+                                , pbtLocSpan = locSpan
+                                , pbtSpeculative = speculative
+                                , pbtUsedGivenCos = usedGivenCos
+                                , pbtHasPolyDict = hasPolyDict
+                                , pbtCacheInfo = cacheInfo
+                                , pbtSideProbeInfo = sideInfo
+                                , pbtBatchIo = batchIo
+                                }
   where
     cgCfgGoal ExplicitDictGoal {cgCfgTy = c} = c
     cgCfgGoal BareNominalGoal {} = Nothing
 
     cgGenGoal ExplicitDictGoal {cgGenTy = g} = g
     cgGenGoal BareNominalGoal {} = Nothing
+
+collectValueVars :: [Type] -> [Var]
+collectValueVars tys =
+  [ v
+  | v <- collectFreeTermAndTyVars tys
+  , let vk = if isTyVar v then tyVarKind v else varType v
+  , not (tcIsLiftedTypeKind vk)
+  , tcIsLiftedTypeKind (typeKind vk)
+  ]
+
+lookupCachedVerdict
+  :: PluginState
+  -> VerdictCacheKey
+  -> [Var]
+  -> Type
+  -> Type
+  -> TcPluginM (Maybe ObsCheckOutcome)
+lookupCachedVerdict st key vars lhs rhs = do
+  let cmEnv = extendCMEs emptyCME vars
+  vcMap <- tcPluginIO (readIORef (psVerdictCache st))
+  pure $ do
+    outerTm <- Map.lookup key vcMap
+    let direct = lookupTypeMapWithScope outerTm cmEnv lhs >>= \inner -> lookupTypeMapWithScope inner cmEnv rhs
+        symHit = do
+          innerSym <- lookupTypeMapWithScope outerTm cmEnv rhs
+          out <- lookupTypeMapWithScope innerSym cmEnv lhs
+          case out of
+            ObsCheckVerified -> Just ObsCheckVerified
+            _ -> Nothing
+    case direct of
+      Just hit -> Just hit
+      Nothing -> symHit
+
+storeCachedVerdict
+  :: PluginState
+  -> VerdictCacheKey
+  -> [Var]
+  -> Type
+  -> Type
+  -> ObsCheckOutcome
+  -> TcPluginM ()
+storeCachedVerdict st key vars lhs rhs outcome = do
+  let cmEnv = extendCMEs emptyCME vars
+  vcMap <- tcPluginIO (readIORef (psVerdictCache st))
+  let outer0 = Map.findWithDefault emptyTypeMap key vcMap
+      inner0 = case lookupTypeMapWithScope outer0 cmEnv lhs of
+        Just m -> m
+        Nothing -> emptyTypeMap
+      inner1 = extendTypeMapWithScope inner0 cmEnv rhs outcome
+      outer1 = extendTypeMapWithScope outer0 cmEnv lhs inner1
+  tcPluginIO (writeIORef (psVerdictCache st) (Map.insert key outer1 vcMap))
+
+finalizePreparedGoals
+  :: PluginState
+  -> CachedObsEnv
+  -> [PreparedGoal]
+  -> Maybe [String]
+  -> TcPluginM [Either Ct (Maybe (EvTerm, Ct))]
+finalizePreparedGoals st cenv prepared mbStrings = go prepared (fromMaybeList mbStrings)
+  where
+    fromMaybeList Nothing = Nothing
+    fromMaybeList (Just xs) = Just xs
+
+    go [] _ = pure []
+    go (PreparedDone res : rest) mbOut = (res :) <$> go rest mbOut
+    go (PreparedTask task : rest) Nothing =
+      let fallback =
+            if pbtSpeculative task && isExplicitGoal (pbtGoal task)
+              then Left (cgCt (pbtGoal task))
+              else Right Nothing
+       in (fallback :) <$> go rest Nothing
+    go (PreparedTask task : rest) (Just []) =
+      let fallback =
+            if pbtSpeculative task && isExplicitGoal (pbtGoal task)
+              then Left (cgCt (pbtGoal task))
+              else Right Nothing
+       in (fallback :) <$> go rest (Just [])
+    go (PreparedTask task : rest) (Just (rawOut : moreOuts)) = do
+      let (verdictLine, mbFpLines) = splitProbePayload rawOut
+      when (not (pbtSpeculative task)) $
+        case (pbtSideProbeInfo task, mbFpLines) of
+          (Just (cfg, vars, lhs, rhs), Just (fpL, fpR)) ->
+            storeSideFingerprints st cfg vars lhs rhs fpL fpR
+          _ -> pure ()
+      case decodeLoopString (pbtHasPolyDict task) verdictLine of
+        Nothing -> do
+          let fallback =
+                if pbtSpeculative task && isExplicitGoal (pbtGoal task)
+                  then Left (cgCt (pbtGoal task))
+                  else Right Nothing
+          (fallback :) <$> go rest (Just moreOuts)
+        Just outcome -> do
+          when (not (pbtSpeculative task)) $
+            case pbtCacheInfo task of
+              Just (key, vars, lhs, rhs) -> storeCachedVerdict st key vars lhs rhs outcome
+              Nothing -> pure ()
+          res <-
+            applyVerdictToGoal
+              st
+              cenv
+              (pbtGoal task)
+              (pbtLocSpan task)
+              (pbtSpeculative task)
+              (pbtUsedGivenCos task)
+              outcome
+          (res :) <$> go rest (Just moreOuts)
+
+    isExplicitGoal ExplicitDictGoal {} = True
+    isExplicitGoal BareNominalGoal {} = False
+
+splitProbePayload :: String -> (String, Maybe ([Word64], [Word64]))
+splitProbePayload raw =
+  case break (== '\x1f') raw of
+    (verdict, []) -> (verdict, Nothing)
+    (verdict, _ : rest1) ->
+      case break (== '\x1f') rest1 of
+        (sL, _ : sR) ->
+          let parseWords = traverse readMaybe . words
+           in (verdict, (,) <$> parseWords sL <*> parseWords sR)
+        _ -> (verdict, Nothing)
+
+storeSideFingerprints
+  :: PluginState
+  -> ObsConfig
+  -> [Var]
+  -> Type
+  -> Type
+  -> [Word64]
+  -> [Word64]
+  -> TcPluginM ()
+storeSideFingerprints st cfg vars lhs rhs fpL fpR = do
+  let cmEnv = extendCMEs emptyCME vars
+  scMap <- tcPluginIO (readIORef (psSideCache st))
+  let tm0 = Map.findWithDefault emptyTypeMap cfg scMap
+      tm1 =
+        if all (== 0) fpL
+          then tm0
+          else extendTypeMapWithScope tm0 cmEnv lhs fpL
+      tm2 =
+        if all (== 0) fpR
+          then tm1
+          else extendTypeMapWithScope tm1 cmEnv rhs fpR
+  tcPluginIO (writeIORef (psSideCache st) (Map.insert cfg tm2 scMap))
+
+decodeLoopString :: Maybe String -> String -> Maybe ObsCheckOutcome
+decodeLoopString mbPolyDict out
+  | out == "PASS" =
+      pure $ case mbPolyDict of
+        Just predStr -> ObsCheckInconclusive (PolymorphicClassConstraint predStr)
+        Nothing -> ObsCheckVerified
+  | "FAIL:" `isPrefixOf` out =
+      Just (ObsCheckRefuted (drop 5 out))
+  | "INCONCLUSIVE:" `isPrefixOf` out
+  , Just reason <- readMaybe (drop 13 out) =
+      Just (ObsCheckInconclusive reason)
+  | otherwise = Nothing
+
+applyVerdictToGoal
+  :: PluginState
+  -> CachedObsEnv
+  -> CandidateGoal
+  -> SrcSpan
+  -> Bool
+  -> [Coercion]
+  -> ObsCheckOutcome
+  -> TcPluginM (Either Ct (Maybe (EvTerm, Ct)))
+applyVerdictToGoal st cenv goal locSpan speculative usedGivenCos outcome = do
+  let ct = cgCt goal
+      origLhs = cgOrigLhs goal
+      origRhs = cgOrigRhs goal
+  case outcome of
+    ObsCheckRefuted counterexample -> do
+      when (not speculative) $
+        emitCounterexampleOnce st locSpan origLhs origRhs counterexample
+      pure (Left ct)
+    ObsCheckInconclusive reason ->
+      case (speculative, poPolicy (psOpts st), goal) of
+        (True, _, ExplicitDictGoal {}) -> pure (Left ct)
+        (True, _, BareNominalGoal {}) -> pure (Right Nothing)
+        (_, RefuteOnly, _) -> pure (Right Nothing)
+        (_, _, ExplicitDictGoal {}) -> do
+          emitInconclusiveOnce st locSpan origLhs origRhs (renderInconclusiveReason reason)
+          pure (Right Nothing)
+        (_, _, BareNominalGoal {}) -> pure (Right Nothing)
+    ObsCheckVerified ->
+      case poPolicy (psOpts st) of
+        RefuteOnly ->
+          case (speculative, goal) of
+            (True, ExplicitDictGoal {}) -> pure (Left ct)
+            _ -> pure (Right Nothing)
+        ExplicitOnly ->
+          case goal of
+            ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} -> do
+              when (not speculative) $
+                tcPluginTrace "dependent-obs-eq: discharged explicit goal" (ppr (ctPred ct))
+              let co = mkPluginUnivCo usedGivenCos origLhs origRhs
+                  ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs co
+              pure (Right (Just (ev, ct)))
+            BareNominalGoal {} -> pure (Right Nothing)
+        ImplicitAssume -> do
+          let co = mkPluginUnivCo usedGivenCos origLhs origRhs
+          case goal of
+            ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} -> do
+              when (not speculative) $
+                tcPluginTrace "dependent-obs-eq: discharged explicit goal" (ppr (ctPred ct))
+              let ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs co
+              pure (Right (Just (ev, ct)))
+            BareNominalGoal {} -> do
+              when (not speculative) $ do
+                tcPluginTrace "dependent-obs-eq: implicitly assumed nominal equality" (ppr (ctPred ct))
+                when (poWarnAssume (psOpts st)) $
+                  emitCounterexampleOnce st locSpan origLhs origRhs
+                    "Note: assumed via policy=assume"
+              pure (Right (Just (evCoercion co, ct)))
 
 mkPluginUnivCo :: [Coercion] -> Type -> Type -> Coercion
 mkPluginUnivCo usedGivenCos lhs rhs =
@@ -770,27 +1032,34 @@ emitPluginDocOnce st sp lhs rhs tag detailsDoc = do
 -- Evaluating Promoted ObsConfig
 -- ---------------------------------------------------------------------------
 
-evalObsConfigType :: CachedObsEnv -> SrcSpan -> Type -> TcM (Maybe ObsConfig)
-evalObsConfigType cenv locSpan cfgTy =
+evalObsConfigType :: PluginState -> CachedObsEnv -> SrcSpan -> Bool -> Type -> TcM (Maybe ObsConfig)
+evalObsConfigType st cenv locSpan speculative cfgTy =
   case decodePromotedObsConfig cfgTy of
     Just cfg -> pure (Just cfg)
     Nothing -> do
-      mbCore <- reifyTypeToCore cenv emptyUFM cfgTy
-      case mbCore of
-        Nothing -> pure Nothing
-        Just cfgExpr
-          | not (exprType cfgExpr `tcEqType` mkTyConApp (ceObsConfigTc cenv) []) ->
-              pure Nothing
-          | otherwise -> do
-              showCls <- lookupOrig (moduleNameToGhcInternal "GHC.Internal.Show") (mkTcOcc "Show") >>= tcLookupClass
-              instEnvs <- tcGetInstEnvs
-              case resolveClassDict cenv Map.empty instEnvs (mkClassPred showCls [mkTyConApp (ceObsConfigTc cenv) []]) of
-                Nothing -> pure Nothing
-                Just showDict ->
-                  case classMethods showCls of
-                    (_ : showId : _) -> evaluateShowableCfg showId showDict cfgExpr
-                    (showId : _) -> evaluateShowableCfg showId showDict cfgExpr
-                    [] -> pure Nothing
+      gblEnv <- getGblEnv
+      localDefs <- getCachedModuleDefs st gblEnv
+      case peelScalarObsConfig localDefs (poConfig (psOpts st)) 16 cfgTy of
+        Just cfg -> pure (Just cfg)
+        Nothing -> do
+          mbCore <- reifyTypeToCore cenv emptyUFM cfgTy
+          case mbCore of
+            Nothing -> pure Nothing
+            Just cfgExpr
+              | not (exprType cfgExpr `tcEqType` mkTyConApp (ceObsConfigTc cenv) []) ->
+                  pure Nothing
+              | Just cfg <- peelScalarObsConfigCore localDefs (poConfig (psOpts st)) 16 cfgExpr ->
+                  pure (Just cfg)
+              | otherwise -> do
+                  showCls <- lookupOrig (moduleNameToGhcInternal "GHC.Internal.Show") (mkTcOcc "Show") >>= tcLookupClass
+                  instEnvs <- tcGetInstEnvs
+                  case resolveClassDict cenv emptyTypeMap instEnvs (mkClassPred showCls [mkTyConApp (ceObsConfigTc cenv) []]) of
+                    Nothing -> pure Nothing
+                    Just showDict ->
+                      case classMethods showCls of
+                        (_ : showId : _) -> evaluateShowableCfg showId showDict cfgExpr
+                        (showId : _) -> evaluateShowableCfg showId showDict cfgExpr
+                        [] -> pure Nothing
   where
     moduleNameToGhcInternal str =
       mkModule (stringToUnit "ghc-internal") (mkModuleName str)
@@ -799,8 +1068,131 @@ evalObsConfigType cenv locSpan cfgTy =
       let cfgKind = mkTyConApp (ceObsConfigTc cenv) []
           strExpr = mkCoreApps (Var showId) [Type cfgKind, showDict, cfgExpr]
           ioExpr = mkCoreApps (Var (cePureIOId cenv)) [Type stringTy, strExpr]
-      mbStr <- runCoreIOString cenv locSpan ioExpr
-      pure (mbStr >>= parseShownObsConfig)
+      mbOuts <- runCoreIOStringBatch st cenv locSpan (not speculative) [ioExpr]
+      pure $ case mbOuts of
+        Just [s] -> parseShownObsConfig s
+        _ -> Nothing
+
+peelScalarObsConfig :: NameEnv (Id, CoreExpr) -> ObsConfig -> Int -> Type -> Maybe ObsConfig
+peelScalarObsConfig localDefs baseCfg = go
+  where
+    go 0 _ = Nothing
+    go fuel ty0 =
+      case coreFullView ty0 of
+        _ | Just cfg <- decodePromotedObsConfig ty0 -> Just cfg
+        TermVarTy v -> peelVar (fuel - 1) v
+        TyConApp tc args ->
+          let occ = getOccString (tyConName tc)
+              cleanOcc
+                | "U:@" `isPrefixOf` occ = reverse (takeWhile (/= ':') (reverse occ))
+                | "U:" `isPrefixOf` occ = drop 2 occ
+                | "T:" `isPrefixOf` occ = drop 2 occ
+                | otherwise = occ
+           in case (cleanOcc, args) of
+                ("defaultObsConfig", []) -> Just baseCfg
+                ("totalObsConfig", []) -> Just baseCfg {obsPartialPct = 0}
+                (fn, [nTy, inner])
+                  | Just n <- isNumLitTy (coreFullView nTy) -> do
+                      cfg <- go (fuel - 1) inner
+                      applyScalarMod fn (fromInteger (max 0 n)) cfg
+                (fn, []) -> peelByOcc localDefs baseCfg (fuel - 1) fn
+                _ -> Nothing
+        _ -> Nothing
+
+    peelVar fuel v
+      | getOccString v == "defaultObsConfig" = Just baseCfg
+      | getOccString v == "totalObsConfig" = Just baseCfg {obsPartialPct = 0}
+      | Just (_, rhs) <- lookupNameEnv localDefs (idName v) =
+          peelScalarObsConfigCore localDefs baseCfg fuel rhs
+      | CoreUnfolding {uf_tmpl = rhs} <- realIdUnfolding v =
+          peelScalarObsConfigCore localDefs baseCfg fuel rhs
+      | otherwise = Nothing
+
+peelByOcc :: NameEnv (Id, CoreExpr) -> ObsConfig -> Int -> String -> Maybe ObsConfig
+peelByOcc localDefs baseCfg fuel occ =
+  case [rhs | (fnId, rhs) <- nonDetEltsUFM localDefs, getOccString fnId == occ] of
+    rhs : _ -> peelScalarObsConfigCore localDefs baseCfg fuel rhs
+    [] -> Nothing
+
+peelScalarObsConfigCore :: NameEnv (Id, CoreExpr) -> ObsConfig -> Int -> CoreExpr -> Maybe ObsConfig
+peelScalarObsConfigCore localDefs baseCfg = go
+  where
+    go 0 _ = Nothing
+    go fuel expr =
+      let (hd, args) = collectArgs ( stripTicks expr )
+          valArgs = [a | a <- args, not (isTypeArg a)]
+       in case hd of
+            Var fn
+              | getOccString fn == "ObsConfig"
+              , [a, b, c, d, e, f] <- valArgs -> do
+                  n1 <- extractNatCore (fuel - 1) a
+                  n2 <- extractNatCore (fuel - 1) b
+                  n3 <- extractNatCore (fuel - 1) c
+                  n4 <- extractNatCore (fuel - 1) d
+                  n5 <- extractNatCore (fuel - 1) e
+                  n6 <- extractNatCore (fuel - 1) f
+                  Just
+                    ObsConfig
+                      { obsTests = max 1 n1
+                      , obsMaxSize = n2
+                      , obsApproxDepth = max 1 n3
+                      , obsPartialPct = min 100 n4
+                      , obsTimeoutUs = max 1 n5
+                      , obsSeed = n6
+                      }
+              | getOccString fn == "defaultObsConfig"
+              , null valArgs ->
+                  Just baseCfg
+              | getOccString fn == "totalObsConfig"
+              , null valArgs ->
+                  Just baseCfg {obsPartialPct = 0}
+              | [nExpr, innerExpr] <- valArgs
+              , Just n <- extractNatCore (fuel - 1) nExpr
+              , Just innerCfg <- go (fuel - 1) innerExpr
+              , Just cfg' <- applyScalarMod (getOccString fn) n innerCfg ->
+                  Just cfg'
+              | null valArgs ->
+                  case lookupNameEnv localDefs (idName fn) of
+                    Just (_, rhs) -> go (fuel - 1) rhs
+                    Nothing ->
+                      case realIdUnfolding fn of
+                        CoreUnfolding {uf_tmpl = rhs} -> go (fuel - 1) rhs
+                        _ -> Nothing
+            _ -> Nothing
+
+    stripTicks (Tick _ e) = stripTicks e
+    stripTicks (Cast e _) = stripTicks e
+    stripTicks e = e
+
+    extractNatCore _ (Lit (LitNumber _ n))
+      | n >= 0 = Just (fromInteger n)
+    extractNatCore fuel e =
+      case collectArgs (stripTicks e) of
+        (Var fn, args)
+          | getOccString fn `elem` ["NS", "fromInteger", "naturalFromInteger"]
+          , a : _ <- [x | x <- args, not (isTypeArg x)] ->
+              extractNatCore fuel a
+          | (fnId, rhs) : _ <- [(b, r) | (b, r) <- nonDetEltsUFM localDefs, idName b == idName fn]
+          , null [x | x <- args, not (isTypeArg x)] ->
+              let _ = fnId in extractNatCore (fuel - 1) rhs
+        _ -> Nothing
+
+applyScalarMod :: String -> Natural -> ObsConfig -> Maybe ObsConfig
+applyScalarMod fn n cfg =
+  case fn of
+    "withTests" -> Just cfg {obsTests = max 1 n}
+    "setTests" -> Just cfg {obsTests = max 1 n}
+    "withMaxSize" -> Just cfg {obsMaxSize = n}
+    "setMaxSize" -> Just cfg {obsMaxSize = n}
+    "withApproxDepth" -> Just cfg {obsApproxDepth = max 1 n}
+    "setApproxDepth" -> Just cfg {obsApproxDepth = max 1 n}
+    "withPartialPct" -> Just cfg {obsPartialPct = min 100 n}
+    "setPartialPct" -> Just cfg {obsPartialPct = min 100 n}
+    "withTimeoutUs" -> Just cfg {obsTimeoutUs = max 1 n}
+    "setTimeoutUs" -> Just cfg {obsTimeoutUs = max 1 n}
+    "withSeed" -> Just cfg {obsSeed = n}
+    "setSeed" -> Just cfg {obsSeed = n}
+    _ -> Nothing
 
 decodePromotedObsConfig :: Type -> Maybe ObsConfig
 decodePromotedObsConfig ty =
@@ -860,30 +1252,44 @@ data ObsCheckOutcome
   | ObsCheckRefuted !String
   | ObsCheckInconclusive !InconclusiveReason
 
-runObservationalCheck
-  :: CachedObsEnv
-  -> SrcSpan
+buildGoalBcoTask
+  :: PluginState
+  -> CachedObsEnv
+  -> IORef AdtCache
   -> ObsConfig
   -> Maybe (Kind, Type)
   -> Kind
   -> Type
   -> Type
-  -> TcM (Maybe ObsCheckOutcome)
-runObservationalCheck cenv locSpan cfg mbCustomGen resKind0 lhs0 rhs0 = do
+  -> TcM (Maybe (CoreExpr, Maybe String, Bool))
+buildGoalBcoTask st cenv adtCacheRef cfg mbCustomGen resKind0 lhs0 rhs0 = do
+  instEnvs <- tcGetInstEnvs
   let rawFree = collectFreeTermAndTyVars [resKind0, lhs0, rhs0]
       typeSkolems = [tv | tv <- rawFree, isTyVar tv, tcIsLiftedTypeKind (tyVarKind tv)]
+      hkSkolems = [tv | tv <- rawFree, isTyVar tv, isUnaryTypeConKind (tyVarKind tv)]
+      allPolySet = mkVarSet (typeSkolems ++ hkSkolems)
+      orderingCarrier = mkTyConTy (ceOrderingTc cenv)
+  (mbPolyClass, needsIntFallback) <-
+    detectPolyClassConstraint instEnvs orderingCarrier allPolySet [resKind0, lhs0, rhs0]
+  let hasPolyDict =
+        case mbPolyClass of
+          Just p -> Just p
+          Nothing
+            | not (null hkSkolems) -> Just "higher-kinded type constructor variable"
+            | otherwise -> Nothing
+      scalarCarrier = if needsIntFallback then intTy else orderingCarrier
       polySubst =
         TySubst.extendTvSubstList
           (TySubst.mkEmptySubst (mkInScopeSet (mkVarSet rawFree)))
-          [(tv, intTy) | tv <- typeSkolems]
+          ([(tv, scalarCarrier) | tv <- typeSkolems] ++ [(tv, mkTyConTy listTyCon) | tv <- hkSkolems])
       substPoly = substTermAndTyVars polySubst
       resKind = substPoly resKind0
       lhs = substPoly lhs0
       rhs = substPoly rhs0
       valVars =
-        [ (v, substPoly (varType v))
+        [ (v, vk)
         | v <- collectFreeTermAndTyVars [lhs, rhs]
-        , let vk = substPoly (varType v)
+        , let vk = substPoly (if isTyVar v then tyVarKind v else varType v)
         , not (tcIsLiftedTypeKind vk)
         , tcIsLiftedTypeKind (typeKind vk)
         ]
@@ -891,8 +1297,6 @@ runObservationalCheck cenv locSpan cfg mbCustomGen resKind0 lhs0 rhs0 = do
   if not (noFreeVarsOfType resKind && isTyFamFree resKind && all (noFreeVarsOfType . snd) valVars && all (isTyFamFree . snd) valVars)
     then pure Nothing
     else do
-      instEnvs <- tcGetInstEnvs
-      adtCacheRef <- liftIO (newIORef Map.empty)
       mbResOps <- resolveDomainOps cenv adtCacheRef instEnvs resKind
       mbVarOps <- traverse (resolveDomainOps cenv adtCacheRef instEnvs . snd) valVars
       case (mbResOps, sequence mbVarOps) of
@@ -928,18 +1332,113 @@ runObservationalCheck cenv locSpan cfg mbCustomGen resKind0 lhs0 rhs0 = do
                           , evalLhsFn
                           , evalRhsFn
                           ]
-                  mbOut <- runCoreIOString cenv locSpan loopCall
-                  pure $ case mbOut of
-                    Just "PASS" -> Just ObsCheckVerified
-                    Just out
-                      | "FAIL:" `isPrefixOf` out ->
-                          Just (ObsCheckRefuted (drop 5 out))
-                      | "INCONCLUSIVE:" `isPrefixOf` out
-                      , Just reason <- readMaybe (drop 13 out) ->
-                          Just (ObsCheckInconclusive reason)
-                    _ -> Nothing
+                  -- Attach 8-probe side fingerprints on standard uncustomized goals (<= 3 vars)
+                  scMap <- liftIO (readIORef (psSideCache st))
+                  let cmEnv = extendCMEs emptyCME (map fst valVars)
+                      sideMap = Map.findWithDefault emptyTypeMap cfg scMap
+                      hasCachedFp =
+                        isJust (lookupTypeMapWithScope sideMap cmEnv lhs0)
+                          && isJust (lookupTypeMapWithScope sideMap cmEnv rhs0)
+                      wantFp = isNothing mbCustomGen && isNothing hasPolyDict && length valVars <= 3 && not hasCachedFp
+                  if not wantFp
+                    then pure (Just (loopCall, hasPolyDict, False))
+                    else do
+                      let fpLCall =
+                            mkCoreApps
+                              (Var (ceEvalSideFpId cenv))
+                              [Type envTy, Type resKind, cfgExpr, envGenExpr, doApprox resOps, evalLhsFn]
+                          fpRCall =
+                            mkCoreApps
+                              (Var (ceEvalSideFpId cenv))
+                              [Type envTy, Type resKind, cfgExpr, envGenExpr, doApprox resOps, evalRhsFn]
+                      combined <- chainSepIO cenv "\x1f" [loopCall, fpLCall, fpRCall]
+                      pure (Just (combined, hasPolyDict, True))
             _ -> pure Nothing
         _ -> pure Nothing
+
+isUnaryTypeConKind :: Kind -> Bool
+isUnaryTypeConKind k =
+  case splitFunTy_maybe (coreFullView k) of
+    Just (_, _, _, dom, res) -> tcIsLiftedTypeKind dom && tcIsLiftedTypeKind res
+    Nothing -> False
+
+detectPolyClassConstraint
+  :: InstEnvs
+  -> Type
+  -> VarSet
+  -> [Type]
+  -> TcM (Maybe String, Bool)
+detectPolyClassConstraint instEnvs orderingCarrier polySet tys
+  | isEmptyVarSet polySet = pure (Nothing, False)
+  | otherwise = do
+      found <- fmap concat (traverse walk tys)
+      pure $ case found of
+        [] -> (Nothing, False)
+        (predStr, _) : _ -> (Just predStr, any snd found)
+  where
+    walk ty =
+      case coreFullView ty of
+        ClassAppTy sel instTy dictTy argTy resK -> do
+          sub <- fmap concat (traverse walk [instTy, dictTy, argTy, resK])
+          let here =
+                case isClassOpId_maybe sel of
+                  Just cls
+                    | not (isEmptyVarSet (tyCoVarsOfType instTy `intersectVarSet` polySet))
+                        || isLocalDictTerm dictTy ->
+                        let predTy = mkClassPred cls [instTy]
+                            noOrd = isLeftEither (lookupUniqueInstEnv instEnvs cls [orderingCarrier])
+                            hasInt = not (isLeftEither (lookupUniqueInstEnv instEnvs cls [intTy]))
+                         in [(showSDocUnsafe (ppr predTy), noOrd && hasInt)]
+                  _ -> []
+          pure (here ++ sub)
+        TyConApp tc args -> do
+          sub <- fmap concat (traverse walk args)
+          if isJust (isPromotedDataCon_maybe tc)
+            then pure sub
+            else do
+              mbFun <- recoverFamilyOwnerId tc
+              let here = case mbFun of
+                    Nothing -> []
+                    Just fun -> inspectFunClassPreds instEnvs orderingCarrier polySet (idType fun) args
+              pure (here ++ sub)
+        AppTy f a -> (++) <$> walk f <*> walk a
+        TermAppTy f a -> (++) <$> walk (varType f) <*> walk a
+        FunTy _ ma mult a r -> fmap concat (traverse walk [ma, mult, a, r])
+        CastTy t _ -> walk t
+        _ -> pure []
+
+    isLocalDictTerm (TermVarTy v) = isLocalVar v
+    isLocalDictTerm _ = False
+
+    isLeftEither (Left _) = True
+    isLeftEither (Right _) = False
+
+inspectFunClassPreds :: InstEnvs -> Type -> VarSet -> Type -> [Type] -> [(String, Bool)]
+inspectFunClassPreds instEnvs orderingCarrier polySet funTy tyArgs =
+  let (_, bndrs, _) = splitPiTys funTy
+      namedTvs = [tv | Named (Bndr tv _) <- bndrs, isTyVar tv]
+      inScope = mkInScopeSet (mkVarSet namedTvs `unionVarSet` polySet)
+      subst =
+        TySubst.extendTvSubstList
+          (TySubst.mkEmptySubst inScope)
+          (zip namedTvs tyArgs)
+      preds =
+        [ TySubst.substTy subst (scaledThing sc)
+        | Anon sc af <- bndrs
+        , not (isVisibleFunArg af)
+        ]
+   in [ (showSDocUnsafe (ppr predTy), needsInt predTy)
+      | predTy <- preds
+      , not (isEmptyVarSet (tyCoVarsOfType predTy `intersectVarSet` polySet))
+      ]
+  where
+    needsInt predTy =
+      case getClassPredTys_maybe predTy of
+        Just (cls, [_]) ->
+          case (lookupUniqueInstEnv instEnvs cls [orderingCarrier], lookupUniqueInstEnv instEnvs cls [intTy]) of
+            (Left _, Right _) -> True
+            _ -> False
+        _ -> False
 
 substTermAndTyVars :: TySubst.Subst -> Type -> Type
 substTermAndTyVars subst = go
@@ -947,13 +1446,18 @@ substTermAndTyVars subst = go
     go ty =
       case coreFullView ty of
         TermVarTy v ->
-          let v' = setVarType v (TySubst.substTy subst (varType v))
+          let v' = setVarType v (go (varType v))
            in TermVarTy v'
+        TermAppTy f arg ->
+          let f' = setVarType f (go (varType f))
+           in TermAppTy f' (go arg)
         TyVarTy tv -> TySubst.substTy subst (mkTyVarTy tv)
         TyConApp tc args -> mkTyConApp tc (map go args)
         AppTy f a -> mkAppTy (go f) (go a)
         FunTy af ma mult a r -> FunTy af (go ma) (go mult) (go a) (go r)
         CastTy t _ -> go t
+        ClassAppTy sel i d x k ->
+          ClassAppTy sel (go i) (go d) (go x) (go k)
         other -> TySubst.substTy subst other
 
 freshLocal :: String -> Type -> TcM Id
@@ -1062,7 +1566,7 @@ foldEnvComponents cenv ((ty1, gen1, shrink1, show1, pid1) : rest) = do
 -- Resolving and Synthesizing ObsGen Dictionaries
 -- ---------------------------------------------------------------------------
 
-type AdtCache = Map.Map String DomainOps
+type AdtCache = TypeMap DomainOps
 
 resolveDomainOps
   :: CachedObsEnv
@@ -1071,16 +1575,15 @@ resolveDomainOps
   -> Type
   -> TcM (Maybe DomainOps)
 resolveDomainOps cenv cacheRef instEnvs domTy = do
-  let key = showSDocUnsafe (ppr domTy)
   cached <- liftIO (readIORef cacheRef)
-  case Map.lookup key cached of
+  case lookupTypeMap cached domTy of
     Just ops -> pure (Just ops)
     Nothing -> do
       let predTy = mkClassPred (ceObsGenCls cenv) [domTy]
       case resolveClassDictWithAdt cenv cached instEnvs predTy of
         Just dictExpr -> do
           let ops = mkOpsFromObsGenDict cenv domTy dictExpr
-          liftIO (writeIORef cacheRef (Map.insert key ops cached))
+          liftIO (writeIORef cacheRef (extendTypeMap cached domTy ops))
           pure (Just ops)
         Nothing -> synthesizeAdtDomainOps cenv cacheRef instEnvs domTy
 
@@ -1115,7 +1618,7 @@ resolveClassDictWithAdt cenv adtCache instEnvs predTy = do
     Left _
       | cls == ceObsGenCls cenv
       , [argTy] <- clsArgs ->
-          doDict <$> Map.lookup (showSDocUnsafe (ppr argTy)) adtCache
+          doDict <$> lookupTypeMap adtCache argTy
       | otherwise -> Nothing
 
 synthesizeAdtDomainOps
@@ -1131,46 +1634,39 @@ synthesizeAdtDomainOps cenv cacheRef instEnvs domTy
   , let dcs = tyConDataCons tc
   , not (null dcs)
   , all isVanillaDataCon dcs = do
-      let key = showSDocUnsafe (ppr domTy)
-          adtBundleTy = mkTyConApp (idResultTyCon (ceMkAdtDictId cenv)) [domTy]
+      let adtBundleTy = mkTyConApp (idResultTyCon (ceMkAdtDictId cenv)) [domTy]
       recBundleId <- freshLocal ("adt_bundle_" ++ getOccString (tyConName tc)) adtBundleTy
       let placeholderOps =
             mkPlaceholderOps cenv domTy (Var recBundleId)
-      liftIO $ do
-        cur <- readIORef cacheRef
-        writeIORef cacheRef (Map.insert key placeholderOps cur)
+      prevCache <- liftIO (readIORef cacheRef)
+      liftIO (writeIORef cacheRef (extendTypeMap prevCache domTy placeholderOps))
 
       let fieldTypesFor dc = map scaledThing (dataConInstArgTys dc tcArgs)
           allFields = concatMap fieldTypesFor dcs
       if not (all (tcIsLiftedTypeKind . typeKind) allFields)
         then do
-          liftIO $ do
-            cur <- readIORef cacheRef
-            writeIORef cacheRef (Map.delete key cur)
+          liftIO (writeIORef cacheRef prevCache)
           pure Nothing
         else do
           mbFieldOps <- traverse (resolveDomainOps cenv cacheRef instEnvs) allFields
           case sequence mbFieldOps of
             Nothing -> do
-              liftIO $ do
-                cur <- readIORef cacheRef
-                writeIORef cacheRef (Map.delete key cur)
+              liftIO (writeIORef cacheRef prevCache)
               pure Nothing
             Just _ -> do
               curCache <- liftIO (readIORef cacheRef)
-              let lookupOps fTy =
-                    Map.lookup (showSDocUnsafe (ppr fTy)) curCache
+              let lookupOps fTy = lookupTypeMap curCache fTy
               mbRhs <- buildMkAdtDictCall cenv domTy dcs tcArgs lookupOps
               case mbRhs of
                 Nothing -> do
-                  liftIO (writeIORef cacheRef (Map.delete key curCache))
+                  liftIO (writeIORef cacheRef prevCache)
                   pure Nothing
                 Just bundleRhs -> do
                   let letBundle body = Let (Rec [(recBundleId, bundleRhs)]) body
                       finalPlaceholder = mkPlaceholderOps cenv domTy (letBundle (Var recBundleId))
                   liftIO $ do
                     cur2 <- readIORef cacheRef
-                    writeIORef cacheRef (Map.insert key finalPlaceholder cur2)
+                    writeIORef cacheRef (extendTypeMap cur2 domTy finalPlaceholder)
                   pure (Just finalPlaceholder)
   | otherwise = pure Nothing
   where
@@ -1402,27 +1898,45 @@ reifyTypeToCore cenv varEnv = go
           pure (Just (mkCharExpr c))
         LitTy (StrTyLit fs) ->
           pure (Just (mkCharListExpr (unpackFS fs)))
+        TermAppTy f arg -> do
+          mf <- go (TermVarTy f)
+          ma <- go arg
+          pure (App <$> mf <*> ma)
+        ClassAppTy sel instTy _ argTy _ -> do
+          case isClassOpId_maybe sel of
+            Nothing -> pure Nothing
+            Just cls -> do
+              instEnvs <- tcGetInstEnvs
+              case resolveClassDict cenv emptyTypeMap instEnvs (mkClassPred cls [instTy]) of
+                Nothing -> pure Nothing
+                Just dictExpr -> do
+                  mbArg <- go argTy
+                  pure ((\argExpr -> mkCoreApps (Var sel) [Type instTy, dictExpr, argExpr]) <$> mbArg)
         TyConApp tc args
           | Just dc <- isPromotedDataCon_maybe tc
           , isVanillaDataCon dc -> do
-              let nVal = dataConSourceArity dc
-              if length args < nVal
+              let valTys = filterOutInvisibleTypes tc args
+                  nVal = dataConSourceArity dc
+              if length valTys > nVal
                 then pure Nothing
                 else do
-                  let valTys = drop (length args - nVal) args
-                      univTys = case splitTyConApp_maybe (coreFullView (typeKind ty)) of
+                  let (_, remArrows, finalResTy) = splitFunTys (typeKind ty)
+                      remDoms = map scaledThing remArrows
+                      univTys = case splitTyConApp_maybe (coreFullView finalResTy) of
                         Just (_, ts) -> ts
                         Nothing -> []
                   mbVals <- traverse go valTys
                   case sequence mbVals of
                     Nothing -> pure Nothing
-                    Just valExprs ->
-                      pure (Just (mkCoreApps (Var (dataConWrapId dc)) (map Type univTys ++ valExprs)))
+                    Just valExprs -> do
+                      etaIds <- zipWithM (\i dom -> freshLocal ("dc_eta" ++ show i) dom) [1 :: Int ..] remDoms
+                      let satCon = mkCoreApps (Var (dataConWrapId dc)) (map Type univTys ++ valExprs ++ map Var etaIds)
+                      pure (Just (mkLams etaIds satCon))
           | otherwise -> do
               mbFun <- recoverFamilyOwnerId tc
               case mbFun of
-                Nothing -> pure Nothing
                 Just fun -> instantiateAndApply cenv fun args (typeKind ty) go
+                Nothing -> reifySingleBranchLambdaFamily cenv varEnv tc args (typeKind ty)
         AppTy f a -> do
           mf <- go f
           ma <- go a
@@ -1471,6 +1985,40 @@ lookupTermId nm = do
       Nothing -> tcLookupIdMaybe nm
     else tcLookupIdMaybe nm
 
+reifySingleBranchLambdaFamily
+  :: CachedObsEnv
+  -> UniqFM Var Id
+  -> TyCon
+  -> [Type]
+  -> Kind
+  -> TcM (Maybe CoreExpr)
+reifySingleBranchLambdaFamily cenv varEnv tc args expectedKind =
+  case famTyConFlav_maybe tc of
+    Just (ClosedTypeFamilyTyCon ctf)
+      | Just ax <- closedTyFamCoAxiom_maybe ctf
+      , [br] <- fromBranches (coAxiomBranches ax) -> do
+          let lhsPats = coAxBranchLHS br
+              rhsTy0 = coAxBranchRHS br
+              (_, remArrows, _) = splitFunTys expectedKind
+              remDoms = map scaledThing remArrows
+          if length args + length remDoms /= length lhsPats
+            then pure Nothing
+            else do
+              let (prefixPats, suffixPats) = splitAt (length args) lhsPats
+                  mbPrefixTvs = traverse getTyVar_maybe prefixPats
+                  mbSuffixTvs = traverse getTyVar_maybe suffixPats
+              case (mbPrefixTvs, mbSuffixTvs) of
+                (Just prefixTvs, Just suffixTvs) -> do
+                  let inScope = mkInScopeSet (mkVarSet (coAxBranchTyVars br))
+                      subst = TySubst.extendTvSubstList (TySubst.mkEmptySubst inScope) (zip prefixTvs args)
+                      rhsTy = TySubst.substTy subst rhsTy0
+                  lamIds <- zipWithM (\i dom -> freshLocal ("fam_lam" ++ show i) dom) [1 :: Int ..] remDoms
+                  let varEnv' = addListToUFM varEnv (zip suffixTvs lamIds)
+                  mbBody <- reifyTypeToCore cenv varEnv' rhsTy
+                  pure (mkLams lamIds <$> mbBody)
+                _ -> pure Nothing
+    _ -> pure Nothing
+
 instantiateAndApply
   :: CachedObsEnv
   -> Id
@@ -1482,10 +2030,19 @@ instantiateAndApply cenv fun allArgs expectedRes reifyArg = do
   let (invisBndrs, rho0) = splitInvisBinders (idType fun)
       (_, scaledArrows, _) = splitFunTys rho0
       nVal = length scaledArrows
-  if length allArgs < nVal
+      nInvisTvs = length [() | Named (Bndr tv _) <- invisBndrs, isTyVar tv]
+      valArgTys
+        | length allArgs >= nInvisTvs && length allArgs - nInvisTvs <= nVal =
+            drop nInvisTvs allArgs
+        | length allArgs >= nVal =
+            drop (length allArgs - nVal) allArgs
+        | otherwise = []
+      canAlign =
+        (length allArgs >= nInvisTvs && length allArgs - nInvisTvs <= nVal)
+          || length allArgs >= nVal
+  if not canAlign
     then pure Nothing
     else do
-      let valArgTys = drop (length allArgs - nVal) allArgs
       mbValExprs <- traverse reifyArg valArgTys
       case sequence mbValExprs of
         Nothing -> pure Nothing
@@ -1529,7 +2086,15 @@ buildSpecialisedCall cenv instEnvs fun invisBndrs declDomains rho0 actualDomains
           namedTvs
       substDomains = map (TySubst.substTy initSubst) declDomains
       substRes = TySubst.substTy initSubst declRes
-  matchedSubst <- tcMatchTys (substDomains ++ [substRes]) (actualDomains ++ [expectedRes])
+      nGiven = length valExprs
+      (givenDeclDoms, remDeclDoms) = splitAt nGiven substDomains
+      (_, expRemArrows, expFinalRes) = splitFunTys expectedRes
+      expRemDoms = map scaledThing expRemArrows
+  guard (length remDeclDoms == length expRemDoms)
+  matchedSubst <-
+    tcMatchTys
+      (givenDeclDoms ++ remDeclDoms ++ [substRes])
+      (actualDomains ++ expRemDoms ++ [expFinalRes])
   let lookupTv tv = do
         step1 <- TySubst.lookupTyVar initSubst tv
         let step2 = TySubst.substTy matchedSubst step1
@@ -1539,23 +2104,51 @@ buildSpecialisedCall cenv instEnvs fun invisBndrs declDomains rho0 actualDomains
     Named (Bndr tv _) -> Type <$> lookupTv tv
     Anon predScaled _ -> do
       let predTy = TySubst.substTy matchedSubst (TySubst.substTy initSubst (scaledThing predScaled))
-      resolveClassDict cenv Map.empty instEnvs predTy
+      resolveClassDict cenv emptyTypeMap instEnvs predTy
   pure (mkCoreApps (Var fun) (instArgs ++ valExprs))
 
 -- ---------------------------------------------------------------------------
--- Executing Core IO String in hscInterp (with Same-Module LetRec & ITbls)
+-- Executing Batched Core IO Strings in hscInterp (with Cached LetRec & ITbls)
 -- ---------------------------------------------------------------------------
 
-runCoreIOString :: CachedObsEnv -> SrcSpan -> CoreExpr -> TcM (Maybe String)
-runCoreIOString cenv locSpan ioStrExpr = do
+chainSepIO :: CachedObsEnv -> String -> [CoreExpr] -> TcM CoreExpr
+chainSepIO cenv _ [] =
+  pure (mkCoreApps (Var (cePureIOId cenv)) [Type stringTy, mkCharListExpr ""])
+chainSepIO _ _ [single] = pure single
+chainSepIO cenv delimStr (e : rest) = do
+  restIO <- chainSepIO cenv delimStr rest
+  vHead <- freshLocal "obs_batch_hd" stringTy
+  vTail <- freshLocal "obs_batch_tl" stringTy
+  let catExpr a b = mkCoreApps (Var (ceAppendStrId cenv)) [a, b]
+      joined = Var vHead `catExpr` mkCharListExpr delimStr `catExpr` Var vTail
+      pureJoined = mkCoreApps (Var (cePureIOId cenv)) [Type stringTy, joined]
+      bindTail = mkCoreApps (Var (ceBindIOId cenv)) [Type stringTy, Type stringTy, restIO, Lam vTail pureJoined]
+  pure (mkCoreApps (Var (ceBindIOId cenv)) [Type stringTy, Type stringTy, e, Lam vHead bindTail])
+
+splitOnChar :: Char -> String -> [String]
+splitOnChar delim s =
+  case break (== delim) s of
+    (chunk, []) -> [chunk]
+    (chunk, _ : rest) -> chunk : splitOnChar delim rest
+
+runCoreIOStringBatch
+  :: PluginState
+  -> CachedObsEnv
+  -> SrcSpan
+  -> Bool
+  -> [CoreExpr]
+  -> TcM (Maybe [String])
+runCoreIOStringBatch _ _ _ _ [] = pure (Just [])
+runCoreIOStringBatch st cenv locSpan recordSideEffects ioExprs = do
   hscEnv0 <- getTopEnv
   case hsc_interp hscEnv0 of
     Nothing -> pure Nothing
     Just _ -> do
       let hscEnv = hscEnv0 {hsc_dflags = gopt_unset (hsc_dflags hscEnv0) Opt_OmitYields}
           interp = hscInterp hscEnv
+      ioStrExpr <- chainSepIO cenv "\x1e" ioExprs
       gblEnv <- getGblEnv
-      locals <- collectLocalDefinitions gblEnv ioStrExpr
+      locals <- collectLocalDefinitions st gblEnv ioStrExpr
       let (localNames, expr1) = inlineLocalLetRec locals ioStrExpr
       fullExpr <- resolveFreeLocalDicts cenv expr1
       let localAlgTcs =
@@ -1563,7 +2156,7 @@ runCoreIOString cenv locSpan ioStrExpr = do
             | tc <- tcg_tcs gblEnv
             , isBoxedDataTyCon tc && not (isTypeDataTyCon tc)
             ]
-      when (not (null localNames)) $
+      when (recordSideEffects && not (null localNames)) $
         updTcRef (tcg_source_check gblEnv) $ \s ->
           s { scs_evaluated_uses = extendNameSetList (scs_evaluated_uses s) localNames }
       itblTag <- newUnique
@@ -1577,11 +2170,12 @@ runCoreIOString cenv locSpan ioStrExpr = do
       case compiled of
         Left _ -> pure Nothing
         Right (hval, links, pkgs) -> do
-          recordThNeededRuntimeDeps links pkgs
+          when recordSideEffects $
+            recordThNeededRuntimeDeps links pkgs
           outcome <- tryAllM $ liftIO (evalString interp hval)
           pure $ case outcome of
             Left _ -> Nothing
-            Right s -> Just s
+            Right s -> Just (splitOnChar '\x1e' s)
 
 loadLocalDataConItbls
   :: Interp
@@ -1621,7 +2215,7 @@ resolveFreeLocalDicts cenv expr = do
       instEnvs <- tcGetInstEnvs
       pairs <- fmap catMaybes $ forM freeLocals $ \v -> do
         zTy <- liftZonkM (zonkTcType (idType v))
-        pure $ case resolveClassDict cenv Map.empty instEnvs zTy of
+        pure $ case resolveClassDict cenv emptyTypeMap instEnvs zTy of
           Just dictExpr -> Just (v, dictExpr)
           Nothing -> Nothing
       if null pairs
@@ -1634,10 +2228,9 @@ resolveFreeLocalDicts cenv expr = do
               subst = CoreSubst.extendIdSubstList (CoreSubst.mkEmptySubst inScope) pairs
           pure (CoreSubst.substExpr subst expr)
 
-collectLocalDefinitions :: TcGblEnv -> CoreExpr -> TcM (NameEnv (Id, CoreExpr))
-collectLocalDefinitions gblEnv expr = do
+collectLocalDefinitions :: PluginState -> TcGblEnv -> CoreExpr -> TcM (NameEnv (Id, CoreExpr))
+collectLocalDefinitions st gblEnv expr = do
   let semMod = tcg_semantic_mod gblEnv
-      baseDefs = tcg_local_open_defs gblEnv
       needsLocal v =
         isId v
           && not (isDataConWorkId v || isDataConWrapId v)
@@ -1645,9 +2238,24 @@ collectLocalDefinitions gblEnv expr = do
       localRoots = [idName v | v <- exprSomeFreeVarsList needsLocal expr]
   if null localRoots
     then pure emptyNameEnv
-    else do
-      extraDefs <- desugarFromTcBinds gblEnv
-      pure (baseDefs `plusNameEnv` extraDefs)
+    else getCachedModuleDefs st gblEnv
+
+getCachedModuleDefs :: PluginState -> TcGblEnv -> TcM (NameEnv (Id, CoreExpr))
+getCachedModuleDefs st gblEnv = do
+  let semMod = tcg_semantic_mod gblEnv
+      baseDefs = tcg_local_open_defs gblEnv
+      bindCount = length (tcg_binds gblEnv)
+  mbCached <- liftIO (readIORef (psDesugarCache st))
+  extraDefs <-
+    case mbCached of
+      Just (cachedMod, cachedCount, cachedEnv)
+        | cachedMod == semMod && cachedCount == bindCount ->
+            pure cachedEnv
+      _ -> do
+        env <- desugarFromTcBinds gblEnv
+        liftIO (writeIORef (psDesugarCache st) (Just (semMod, bindCount, env)))
+        pure env
+  pure (baseDefs `plusNameEnv` extraDefs)
 
 desugarFromTcBinds :: TcGblEnv -> TcM (NameEnv (Id, CoreExpr))
 desugarFromTcBinds gblEnv = do
