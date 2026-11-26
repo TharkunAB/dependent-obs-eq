@@ -79,7 +79,8 @@ import GHC.StgToByteCode ( byteCodeGen )
 import GHC.Tc.Errors.Types ( TcRnMessage (TcRnUnknownMessage) )
 import GHC.Tc.Plugin ( findImportedModule, tcPluginIO, tcPluginTrace )
 import GHC.Tc.Types
-  ( TcGblEnv (..)
+  ( SourceCheckState (..)
+  , TcGblEnv (..)
   , TcM
   , TcPlugin (..)
   , TcPluginM
@@ -1517,7 +1518,8 @@ runCoreIOString cenv locSpan ioStrExpr = do
             , isBoxedDataTyCon tc && not (isTypeDataTyCon tc)
             ]
       when (not (null localNames)) $
-        updTcRef (tcg_evaluated_term_uses gblEnv) (`extendNameSetList` localNames)
+        updTcRef (tcg_source_check gblEnv) $ \s ->
+          s { scs_evaluated_uses = extendNameSetList (scs_evaluated_uses s) localNames }
       itblTag <- newUnique
       compiled <- tryAllM $ liftIO $ do
         (itblLinks, itblPkgs) <-
