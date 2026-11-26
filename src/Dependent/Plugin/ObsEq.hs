@@ -35,8 +35,10 @@ import Numeric.Natural ( Natural )
 import Text.Read ( readMaybe )
 
 import Dependent.ObsEq
-  ( ObsConfig (..)
+  ( InconclusiveReason (..)
+  , ObsConfig (..)
   , defaultObsConfig
+  , renderInconclusiveReason
   )
 
 import GHC.Builtin.Modules ( mkInteractiveModule )
@@ -184,10 +186,12 @@ For each candidate constraint over `(lhs :: R)` and `(rhs :: R)`, the plugin:
    points.
 -}
 
--- | Policy controlling whether passing bare nominal equalities (`Refl`) are
--- left unsolved ('ExplicitOnly') or discharged ('ImplicitAssume').
+-- | Policy controlling whether observational verification emits no coercions
+-- ('RefuteOnly'), discharges only explicit goals ('ExplicitOnly'), or also
+-- discharges bare nominal equalities ('ImplicitAssume').
 data DischargePolicy
-  = ExplicitOnly
+  = RefuteOnly
+  | ExplicitOnly
   | ImplicitAssume
   deriving (Eq, Ord, Show)
 
@@ -230,6 +234,8 @@ parsePluginOpts rawOpts =
 
     applyOpt :: PluginOpts -> String -> Either String PluginOpts
     applyOpt st opt
+      | opt == "refute-only" || opt == "policy=refute-only" =
+          Right st {poPolicy = RefuteOnly}
       | opt == "explicit" || opt == "policy=explicit" =
           Right st {poPolicy = ExplicitOnly}
       | opt == "assume" || opt == "policy=assume" =
@@ -639,12 +645,16 @@ evaluateGoal st cenv rewrites goal = do
   if lhsSub `tcEqType` rhsSub
     then
       case goal of
-        ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} -> do
-          let co = mkPluginUnivCo usedGivenCos origLhs origRhs
-              ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs co
-          pure (Right (Just (ev, ct)))
+        ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} ->
+          case poPolicy (psOpts st) of
+            RefuteOnly -> pure (Right Nothing)
+            _ -> do
+              let co = mkPluginUnivCo usedGivenCos origLhs origRhs
+                  ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs co
+              pure (Right (Just (ev, ct)))
         BareNominalGoal {} ->
           case poPolicy (psOpts st) of
+            RefuteOnly -> pure (Right Nothing)
             ExplicitOnly -> pure (Right Nothing)
             ImplicitAssume -> do
               let co = mkPluginUnivCo usedGivenCos origLhs origRhs
@@ -660,20 +670,35 @@ evaluateGoal st cenv rewrites goal = do
             runObservationalCheck cenv locSpan cfg (cgGenGoal goal) (cgKind goal) lhsSub rhsSub
           case mbResult of
             Nothing -> pure (Right Nothing)
-            Just (Left counterexample) -> do
+            Just (ObsCheckRefuted counterexample) -> do
               emitCounterexampleOnce st locSpan origLhs origRhs counterexample
               pure (Left ct)
-            Just (Right ()) -> do
-              let co = mkPluginUnivCo usedGivenCos origLhs origRhs
-              case goal of
-                ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} -> do
-                  tcPluginTrace "dependent-obs-eq: discharged explicit goal" (ppr (ctPred ct))
-                  let ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs co
-                  pure (Right (Just (ev, ct)))
-                BareNominalGoal {} ->
-                  case poPolicy (psOpts st) of
-                    ExplicitOnly -> pure (Right Nothing)
-                    ImplicitAssume -> do
+            Just (ObsCheckInconclusive reason) -> do
+              case (poPolicy (psOpts st), goal) of
+                (RefuteOnly, _) -> pure (Right Nothing)
+                (_, ExplicitDictGoal {}) -> do
+                  emitInconclusiveOnce st locSpan origLhs origRhs (renderInconclusiveReason reason)
+                  pure (Right Nothing)
+                (_, BareNominalGoal {}) -> pure (Right Nothing)
+            Just ObsCheckVerified ->
+              case poPolicy (psOpts st) of
+                RefuteOnly -> pure (Right Nothing)
+                ExplicitOnly ->
+                  case goal of
+                    ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} -> do
+                      tcPluginTrace "dependent-obs-eq: discharged explicit goal" (ppr (ctPred ct))
+                      let co = mkPluginUnivCo usedGivenCos origLhs origRhs
+                          ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs co
+                      pure (Right (Just (ev, ct)))
+                    BareNominalGoal {} -> pure (Right Nothing)
+                ImplicitAssume -> do
+                  let co = mkPluginUnivCo usedGivenCos origLhs origRhs
+                  case goal of
+                    ExplicitDictGoal {cgClass = cls, cgClassArgs = clsArgs, cgKind = k} -> do
+                      tcPluginTrace "dependent-obs-eq: discharged explicit goal" (ppr (ctPred ct))
+                      let ev = mkExplicitDictEv cenv cls clsArgs k origLhs origRhs co
+                      pure (Right (Just (ev, ct)))
+                    BareNominalGoal {} -> do
                       tcPluginTrace "dependent-obs-eq: implicitly assumed nominal equality" (ppr (ctPred ct))
                       when (poWarnAssume (psOpts st)) $
                         emitCounterexampleOnce st locSpan origLhs origRhs
@@ -713,20 +738,33 @@ mkExplicitDictEv cenv cls clsArgs k lhs _rhs co =
    in EvExpr dictExpr
 
 emitCounterexampleOnce :: PluginState -> SrcSpan -> Type -> Type -> String -> TcPluginM ()
-emitCounterexampleOnce st sp lhs rhs details = do
+emitCounterexampleOnce st sp lhs rhs details =
+  emitPluginDocOnce st sp lhs rhs ("refuted|" ++ details) $
+    hang
+      (text "Observational equivalence refuted for" <+> hcat [quotes (ppr lhs <+> text "~" <+> ppr rhs), text ":"])
+      2
+      (text details)
+
+emitInconclusiveOnce :: PluginState -> SrcSpan -> Type -> Type -> String -> TcPluginM ()
+emitInconclusiveOnce st sp lhs rhs details =
+  emitPluginDocOnce st sp lhs rhs ("inconclusive|" ++ details) $
+    hang
+      (text "Observational equivalence inconclusive for" <+> hcat [quotes (ppr lhs <+> text "~" <+> ppr rhs), text ":"])
+      2
+      (text details)
+
+emitPluginDocOnce :: PluginState -> SrcSpan -> Type -> Type -> String -> SDoc -> TcPluginM ()
+emitPluginDocOnce st sp lhs rhs tag detailsDoc = do
   let spKey = showSDocUnsafe (ppr sp)
-      summary = showSDocUnsafe (ppr lhs <+> text "~" <+> ppr rhs) ++ "|" ++ details
+      summary = showSDocUnsafe (ppr lhs <+> text "~" <+> ppr rhs) ++ "|" ++ tag
   seen <- tcPluginIO (readIORef (psReportedSpans st))
   when (not ((spKey, summary) `Set.member` seen)) $ do
     tcPluginIO (writeIORef (psReportedSpans st) (Set.insert (spKey, summary) seen))
-    let doc =
-          hang
-            (text "Observational equivalence refuted for" <+> hcat [quotes (ppr lhs <+> text "~" <+> ppr rhs), text ":"])
-            2
-            (text details)
-    unsafeTcPluginTcM $
-      addErrAt sp $
-        TcRnUnknownMessage (mkSimpleUnknownDiagnostic (mkPlainError noHints doc))
+    unsafeTcPluginTcM $ do
+      dflags <- getDynFlags
+      when (not (gopt Opt_DeferTypeErrors dflags)) $
+        addErrAt sp $
+          TcRnUnknownMessage (mkSimpleUnknownDiagnostic (mkPlainError noHints detailsDoc))
 
 -- ---------------------------------------------------------------------------
 -- Evaluating Promoted ObsConfig
@@ -817,6 +855,11 @@ data DomainOps = DomainOps
   , doShow :: !CoreExpr
   }
 
+data ObsCheckOutcome
+  = ObsCheckVerified
+  | ObsCheckRefuted !String
+  | ObsCheckInconclusive !InconclusiveReason
+
 runObservationalCheck
   :: CachedObsEnv
   -> SrcSpan
@@ -825,7 +868,7 @@ runObservationalCheck
   -> Kind
   -> Type
   -> Type
-  -> TcM (Maybe (Either String ()))
+  -> TcM (Maybe ObsCheckOutcome)
 runObservationalCheck cenv locSpan cfg mbCustomGen resKind0 lhs0 rhs0 = do
   let rawFree = collectFreeTermAndTyVars [resKind0, lhs0, rhs0]
       typeSkolems = [tv | tv <- rawFree, isTyVar tv, tcIsLiftedTypeKind (tyVarKind tv)]
@@ -887,10 +930,13 @@ runObservationalCheck cenv locSpan cfg mbCustomGen resKind0 lhs0 rhs0 = do
                           ]
                   mbOut <- runCoreIOString cenv locSpan loopCall
                   pure $ case mbOut of
-                    Just "PASS" -> Just (Right ())
+                    Just "PASS" -> Just ObsCheckVerified
                     Just out
                       | "FAIL:" `isPrefixOf` out ->
-                          Just (Left (drop 5 out))
+                          Just (ObsCheckRefuted (drop 5 out))
+                      | "INCONCLUSIVE:" `isPrefixOf` out
+                      , Just reason <- readMaybe (drop 13 out) ->
+                          Just (ObsCheckInconclusive reason)
                     _ -> Nothing
             _ -> pure Nothing
         _ -> pure Nothing

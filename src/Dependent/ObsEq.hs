@@ -64,6 +64,10 @@ module Dependent.ObsEq
   , freshBottom
   , mixPartial
   , ObsTree (..)
+  , InconclusiveReason (..)
+  , ObsCmp (..)
+  , ObsVerdict (..)
+  , compareObsTree
   , evalObsSample
   , renderObsTree
   , ObsGen (..)
@@ -76,6 +80,8 @@ module Dependent.ObsEq
   , adtApprox
   , adtShow
   , mkAdtObsDict
+  , evalObsVerdict
+  , renderInconclusiveReason
   , runObsTestLoop
   , obsPureGen
   , obsApGen
@@ -92,9 +98,11 @@ module Dependent.ObsEq
   ) where
 
 import Control.Exception
-  ( Exception (..)
+  ( AllocationLimitExceeded (..)
+  , Exception (..)
   , SomeAsyncException
   , SomeException
+  , bracket
   , catch
   , evaluate
   , throw
@@ -118,6 +126,12 @@ import GHC.Generics
   )
 import Numeric.Natural ( Natural )
 import qualified System.IO.Unsafe
+import System.Mem
+  ( disableAllocationLimit
+  , enableAllocationLimit
+  , getAllocationCounter
+  , setAllocationCounter
+  )
 import System.Timeout ( timeout )
 
 {- Note [Observational equivalence combinators]
@@ -147,7 +161,7 @@ data ObsConfig = ObsConfig
   , obsMaxSize :: Natural
   -- ^ Maximum generator size parameter (default: @20@).
   , obsApproxDepth :: Natural
-  -- ^ Maximum constructor-tree approximation depth (default: @8@).
+  -- ^ Maximum constructor-tree approximation depth (default: @100@).
   , obsPartialPct :: Natural
   -- ^ Percentage @[0..100]@ of samples that inject 'ObsBottom' thunks (default: @25@).
   , obsTimeoutUs :: Natural
@@ -163,7 +177,7 @@ defaultObsConfig =
   ObsConfig
     { obsTests = 100
     , obsMaxSize = 20
-    , obsApproxDepth = 8
+    , obsApproxDepth = 100
     , obsPartialPct = 25
     , obsTimeoutUs = 10000
     , obsSeed = 0
@@ -390,6 +404,7 @@ mixPartial pct g
   | otherwise = frequency [(pct, freshBottom), (100 - pct, g)]
 
 -- | Bounded Kleene approximation of a Haskell value.
+-- See Note [Three-valued Kleene observation lattice].
 data ObsTree
   = ObsCon !String ![ObsTree]
   | ObsCutoff
@@ -397,6 +412,121 @@ data ObsTree
   | ObsRaisedSyncError
   | ObsTimedOut
   deriving (Eq, Ord, Show)
+
+{- Note [Three-valued Kleene observation lattice]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Bounded evaluation of open terms produces constructor spines, synthetic demand
+probes ('ObsRaisedBottom'), resource limits ('ObsCutoff' and 'ObsTimedOut'), or
+synchronous runtime errors ('ObsRaisedSyncError').
+
+Treating 'ObsTree' equality via derived 'Eq' is unsound:
+1. 'ObsCutoff' == 'ObsCutoff' equates distinct finite values that agree up to
+   'obsApproxDepth' (such as @Succ^100 Zero@ and @Succ^100 (Succ Zero)@).
+2. 'ObsTimedOut' == 'ObsTimedOut' equates distinct slow or diverging terms and
+   makes typechecking depend on wall-clock scheduling.
+3. 'ObsRaisedSyncError' == 'ObsRaisedSyncError' equates distinct runtime
+   exceptions.
+
+Function 'compareObsTree' evaluates a strong three-valued Kleene lattice
+('ObsCmp'):
+* Two 'ObsCon' nodes with different constructor names or arities are
+  'ObsApart'. Matching constructors combine child results with Kleene
+  conjunction: any 'ObsApart' child yields 'ObsApart' immediately (for example,
+  @(Zero, loop)@ vs @(Succ Zero, loop)@ is 'ObsApart' at 'fst'), else any
+  'ObsUnknown' child yields 'ObsUnknown', else 'ObsEqual'.
+* 'ObsRaisedBottom' carries the deterministic PRNG tag of an injected partial
+  input thunk. Raising the same tag on both sides proves identical first-demand
+  laziness ('ObsEqual'); raising different tags or matching a value against
+  'ObsRaisedBottom' proves a strictness mismatch ('ObsApart').
+* Resource limits ('ObsCutoff', 'ObsTimedOut') and double 'ObsRaisedSyncError'
+  always yield 'ObsUnknown', which aggregates to 'Inconclusive' and never emits
+  a nominal coercion.
+-}
+
+-- | Reason why bounded testing returned 'Inconclusive'.
+-- See Note [Three-valued Kleene observation lattice].
+data InconclusiveReason
+  = DepthCutoffReached !Natural
+  | TimeoutReached !Natural
+  | SyncExceptionRaised
+  | InsufficientPreconditionHits !Natural !Natural
+  | PolymorphicClassConstraint !String
+  deriving (Eq, Ord, Show, Read)
+
+-- | Per-sample three-valued strong Kleene observation result.
+-- See Note [Three-valued Kleene observation lattice].
+data ObsCmp
+  = ObsEqual
+  -- ^ Both trees are finite constructor spines with identical constructors and
+  -- leaves, or both raised the same injected 'ObsBottom' tag.
+  | ObsApart
+  -- ^ Definite mismatch at a finite constructor path or demand probe.
+  | ObsUnknown !InconclusiveReason
+  -- ^ At least one side hit a resource cutoff, timeout, or synchronous error,
+  -- and no finite branch was 'ObsApart'.
+  deriving (Eq, Show)
+
+-- | Aggregate verdict of bounded observational testing across all samples.
+data ObsVerdict env
+  = Verified
+  | Refuted !Int !Int !env !ObsTree !ObsTree
+  | Inconclusive !InconclusiveReason
+  deriving (Eq, Show)
+
+-- | Compare two 'ObsTree' observations in the strong Kleene lattice.
+-- See Note [Three-valued Kleene observation lattice].
+compareObsTree :: Natural -> Natural -> ObsTree -> ObsTree -> ObsCmp
+compareObsTree depth timeoutUs t1 t2 =
+  case (t1, t2) of
+    (ObsCon c1 as1, ObsCon c2 as2)
+      | c1 /= c2 || length as1 /= length as2 -> ObsApart
+      | otherwise -> foldKleene (zipWith (compareObsTree depth timeoutUs) as1 as2)
+    (ObsRaisedBottom b1, ObsRaisedBottom b2)
+      | b1 == b2 -> ObsEqual
+      | otherwise -> ObsApart
+    (ObsCon _ _, ObsRaisedBottom _) -> ObsApart
+    (ObsRaisedBottom _, ObsCon _ _) -> ObsApart
+    (ObsCon _ _, ObsRaisedSyncError) -> ObsApart
+    (ObsRaisedSyncError, ObsCon _ _) -> ObsApart
+    (ObsRaisedBottom _, ObsRaisedSyncError) -> ObsApart
+    (ObsRaisedSyncError, ObsRaisedBottom _) -> ObsApart
+    (ObsTimedOut, _) -> ObsUnknown (TimeoutReached timeoutUs)
+    (_, ObsTimedOut) -> ObsUnknown (TimeoutReached timeoutUs)
+    (ObsCutoff, _) -> ObsUnknown (DepthCutoffReached depth)
+    (_, ObsCutoff) -> ObsUnknown (DepthCutoffReached depth)
+    (ObsRaisedSyncError, ObsRaisedSyncError) -> ObsUnknown SyncExceptionRaised
+  where
+    foldKleene :: [ObsCmp] -> ObsCmp
+    foldKleene [] = ObsEqual
+    foldKleene (ObsApart : _) = ObsApart
+    foldKleene (ObsEqual : rest) = foldKleene rest
+    foldKleene (ObsUnknown r : rest) =
+      case foldKleene rest of
+        ObsApart -> ObsApart
+        _ -> ObsUnknown r
+
+-- | Render an 'InconclusiveReason' as an actionable diagnostic message.
+renderInconclusiveReason :: InconclusiveReason -> String
+renderInconclusiveReason (DepthCutoffReached d) =
+  "approximation depth cutoff ("
+    ++ show d
+    ++ ") reached; increase setApproxDepth or project a finite prefix with obsEqOn"
+renderInconclusiveReason (TimeoutReached us) =
+  "per-sample timeout ("
+    ++ show us
+    ++ " us) or allocation limit reached; increase setTimeoutUs or restrict non-terminating inputs"
+renderInconclusiveReason SyncExceptionRaised =
+  "both sides raised synchronous runtime exceptions; restrict partial inputs with a Given guard and forVar/forType"
+renderInconclusiveReason (InsufficientPreconditionHits passed needed) =
+  "precondition guard matched only "
+    ++ show passed
+    ++ " of "
+    ++ show needed
+    ++ " required sample(s); supply a matching ObsDomain via forVar or forType"
+renderInconclusiveReason (PolymorphicClassConstraint predStr) =
+  "polymorphic class constraint ("
+    ++ predStr
+    ++ ") cannot be discharged soundly by monomorphic specialization"
 
 -- | Render an 'ObsTree' concisely for counterexample diagnostics.
 renderObsTree :: ObsTree -> String
@@ -408,24 +538,40 @@ renderObsTree (ObsRaisedBottom tag) = "<bottom#" ++ show tag ++ ">"
 renderObsTree ObsRaisedSyncError = "<exception>"
 renderObsTree ObsTimedOut = "<timeout>"
 
--- | Evaluate one bounded observation under a microsecond timeout, catching
--- 'ObsBottom' and synchronous exceptions while rethrowing asynchronous ones.
+-- | Evaluate one bounded observation under a microsecond timeout and a 64 MiB
+-- per-sample allocation guard, catching 'ObsBottom' and synchronous exceptions
+-- while rethrowing external asynchronous exceptions.
 evalObsSample :: Int -> (Int -> a -> IO ObsTree) -> Int -> a -> IO ObsTree
 evalObsSample timeoutUs approxFn depth val = do
-  mb <- timeout (max 1 timeoutUs) (catchObs (approxFn depth val))
+  mb <- timeout (max 1 timeoutUs) (catchObs (withAllocGuard (approxFn depth val)))
   pure $ case mb of
     Nothing -> ObsTimedOut
     Just tree -> tree
+  where
+    withAllocGuard :: IO ObsTree -> IO ObsTree
+    withAllocGuard act =
+      bracket
+        ( do
+            prev <- getAllocationCounter
+            setAllocationCounter (64 * 1024 * 1024)
+            enableAllocationLimit
+            pure prev
+        )
+        (\prev -> disableAllocationLimit >> setAllocationCounter prev)
+        (\_ -> act)
 
 catchObs :: IO ObsTree -> IO ObsTree
 catchObs act =
   act `catch` \(exn :: SomeException) ->
-    case fromException exn :: Maybe SomeAsyncException of
-      Just asyncExn -> throwIO asyncExn
+    case fromException exn :: Maybe AllocationLimitExceeded of
+      Just AllocationLimitExceeded -> pure ObsTimedOut
       Nothing ->
-        case fromException exn :: Maybe ObsBottom of
-          Just (ObsBottom tag) -> pure (ObsRaisedBottom tag)
-          Nothing -> pure ObsRaisedSyncError
+        case fromException exn :: Maybe SomeAsyncException of
+          Just asyncExn -> throwIO asyncExn
+          Nothing ->
+            case fromException exn :: Maybe ObsBottom of
+              Just (ObsBottom tag) -> pure (ObsRaisedBottom tag)
+              Nothing -> pure ObsRaisedSyncError
 
 -- | Domain types with total generation, partial demand generation, shrinking,
 -- bounded Kleene approximation, and counterexample rendering.
@@ -557,7 +703,13 @@ shrinkIntegral n =
    in neg ++ halves
 
 instance ObsGen Int where
-  obsGen = sized $ \sz -> chooseInt (-sz, sz)
+  obsGen = sized $ \sz ->
+    if sz <= 0
+      then pure 0
+      else
+        if sz <= 4
+          then frequency [(1, elements [0, 1, -1, 2, -2]), (3, chooseInt (-sz, sz))]
+          else chooseInt (-sz, sz)
   obsGenPartial pct = mixPartial pct obsGen
   obsShrink = shrinkIntegral
   obsApprox = obsScalarApprox
@@ -985,9 +1137,127 @@ mkAdtObsDict baseGens totalCons partialCons rawShrink rawApprox rawShow =
                     Just (ObsBottom tag) -> pure ("<bottom#" ++ show tag ++ ">")
                     Nothing -> pure "<exception>"
 
+-- | Compute the three-valued 'ObsVerdict' across the configured sample schedule.
+evalObsVerdict
+  :: forall env r.
+     ObsConfig
+  -> (Int -> Gen env)
+  -> (env -> [env])
+  -> (Int -> r -> IO ObsTree)
+  -> (env -> r)
+  -> (env -> r)
+  -> IO (ObsVerdict env)
+evalObsVerdict cfg mkEnvGen shrinkEnv approxR evalLhs evalRhs = do
+  let nTests = max 1 (fromIntegral (obsTests cfg) :: Int)
+      maxSz = max 0 (fromIntegral (obsMaxSize cfg) :: Int)
+      depth = max 1 (fromIntegral (obsApproxDepth cfg) :: Int)
+      depthNat = obsApproxDepth cfg
+      partPct = min 100 (max 0 (fromIntegral (obsPartialPct cfg) :: Int))
+      tmoUs = max 1 (fromIntegral (obsTimeoutUs cfg) :: Int)
+      tmoNat = obsTimeoutUs cfg
+      seed0 = fromIntegral (obsSeed cfg) :: Word64
+      totalGen = mkEnvGen 0
+      partialGen = mkEnvGen partPct
+      shallowTmo = min 500 tmoUs
+
+      testEnv :: env -> IO (ObsCmp, ObsTree, ObsTree)
+      testEnv env = do
+        let valL = evalLhs env
+            valR = evalRhs env
+        if depth <= 2
+          then do
+            tL <- evalObsSample tmoUs approxR depth valL
+            tR <- evalObsSample tmoUs approxR depth valR
+            pure (compareObsTree (max 1 depthNat) (max 1 tmoNat) tL tR, tL, tR)
+          else do
+            tL2 <- evalObsSample shallowTmo approxR 2 valL
+            tR2 <- evalObsSample shallowTmo approxR 2 valR
+            case compareObsTree 2 (fromIntegral (max 1 shallowTmo)) tL2 tR2 of
+              ObsEqual -> pure (ObsEqual, tL2, tR2)
+              ObsApart -> pure (ObsApart, tL2, tR2)
+              ObsUnknown _ -> do
+                tL <- evalObsSample tmoUs approxR depth valL
+                tR <- evalObsSample tmoUs approxR depth valR
+                pure (compareObsTree (max 1 depthNat) (max 1 tmoNat) tL tR, tL, tR)
+
+      shrinkLoop :: Int -> env -> (ObsTree, ObsTree) -> IO (Int, env, (ObsTree, ObsTree))
+      shrinkLoop steps cur bestTrees
+        | steps >= 64 = pure (steps, cur, bestTrees)
+        | otherwise = findSmaller (take 32 (shrinkEnv cur))
+        where
+          findSmaller [] = pure (steps, cur, bestTrees)
+          findSmaller (cand : rest) = do
+            (cmp, tL', tR') <- testEnv cand
+            case cmp of
+              ObsApart -> shrinkLoop (steps + 1) cand (tL', tR')
+              _ -> findSmaller rest
+
+      loop :: Int -> Maybe InconclusiveReason -> IO (ObsVerdict env)
+      loop idx mbUnknown
+        | idx >= nTests =
+            pure $ case mbUnknown of
+              Nothing -> Verified
+              Just reason -> Inconclusive reason
+        | otherwise = do
+            let sz = sampleScheduleSize idx nTests maxSz
+                usePartial = partPct > 0 && idx >= 5 && ((idx * 37 + 13) `rem` 100 < partPct)
+                baseGen = if usePartial then partialGen else totalGen
+                chosenGen = applyAxisProbe idx sz baseGen
+                env = runGenAt seed0 idx sz chosenGen
+            (cmp, tL, tR) <- testEnv env
+            case cmp of
+              ObsEqual -> loop (idx + 1) mbUnknown
+              ObsUnknown r ->
+                let nextUnknown = case mbUnknown of
+                      Nothing -> Just r
+                      Just prev -> Just prev
+                 in loop (idx + 1) nextUnknown
+              ObsApart -> do
+                (shrunkSteps, minEnv, (minL, minR)) <- shrinkLoop 0 env (tL, tR)
+                pure (Refuted (idx + 1) shrunkSteps minEnv minL minR)
+
+  loop 0 Nothing
+
+sampleScheduleSize :: Int -> Int -> Int -> Int
+sampleScheduleSize idx nTests maxSz
+  | maxSz <= 0 = 0
+  | nTests <= 1 = maxSz
+  | idx == 0 = 0
+  | idx <= 2 = min maxSz 1
+  | idx <= 4 = min maxSz 2
+  | idx <= 7 = min maxSz 3
+  | idx == nTests - 1 = maxSz
+  | otherwise =
+      let remN = max 1 (nTests - 8)
+          k = idx - 8
+          spanCube = toInteger maxSz * toInteger maxSz * toInteger maxSz
+          u = (toInteger (remN - 1 - k) * spanCube) `quot` toInteger remN
+          r = integerCubeRoot u
+       in max 1 (min maxSz (maxSz - fromIntegral r))
+
+integerCubeRoot :: Integer -> Integer
+integerCubeRoot n
+  | n <= 0 = 0
+  | otherwise = go n
+  where
+    go x =
+      let x' = (2 * x + (n `quot` (x * x))) `quot` 3
+       in if x' >= x then x else go x'
+
+applyAxisProbe :: Int -> Int -> Gen a -> Gen a
+applyAxisProbe idx sz (Gen g)
+  | idx >= 1 && idx <= 4 = Gen $ \s _ ->
+      let (s1, s2) = splitSeed s
+          (w, _) = stepSeed s1
+          probeSz = if even idx then max 1 sz else 0
+          _ = w
+       in g s2 probeSz
+  | otherwise = Gen g
+
 -- | Execute the bounded observational test loop for a constraint and return
--- @\"PASS\"@ when all samples agree, or @\"FAIL:\"@ followed by a shrunk
--- counterexample summary when falsified.
+-- @\"PASS\"@ when all samples agree, @\"FAIL:\"@ followed by a shrunk
+-- counterexample summary when falsified, or @\"INCONCLUSIVE:\"@ followed by an
+-- encoded 'InconclusiveReason' when resource or exception limits intervene.
 runObsTestLoop
   :: forall env r.
      ObsConfig
@@ -1005,63 +1275,23 @@ runObsTestLoop
   -- ^ Right-hand side evaluator.
   -> IO String
 runObsTestLoop cfg mkEnvGen shrinkEnv showEnv approxR evalLhs evalRhs = do
-  let nTests = max 1 (fromIntegral (obsTests cfg) :: Int)
-      maxSz = max 0 (fromIntegral (obsMaxSize cfg) :: Int)
-      depth = max 1 (fromIntegral (obsApproxDepth cfg) :: Int)
-      partPct = min 100 (max 0 (fromIntegral (obsPartialPct cfg) :: Int))
-      tmoUs = max 1 (fromIntegral (obsTimeoutUs cfg) :: Int)
-      seed0 = fromIntegral (obsSeed cfg) :: Word64
-      totalGen = mkEnvGen 0
-      partialGen = mkEnvGen partPct
-
-      testEnv :: env -> IO (Maybe (ObsTree, ObsTree))
-      testEnv env = do
-        tL <- evalObsSample tmoUs approxR depth (evalLhs env)
-        tR <- evalObsSample tmoUs approxR depth (evalRhs env)
-        if tL == tR
-          then pure Nothing
-          else pure (Just (tL, tR))
-
-      shrinkLoop :: Int -> env -> (ObsTree, ObsTree) -> IO (Int, env, (ObsTree, ObsTree))
-      shrinkLoop steps cur bestTrees
-        | steps >= 64 = pure (steps, cur, bestTrees)
-        | otherwise = findSmaller (take 32 (shrinkEnv cur))
-        where
-          findSmaller [] = pure (steps, cur, bestTrees)
-          findSmaller (cand : rest) = do
-            res <- testEnv cand
-            case res of
-              Just trees' -> shrinkLoop (steps + 1) cand trees'
-              Nothing -> findSmaller rest
-
-      loop :: Int -> IO String
-      loop idx
-        | idx >= nTests = pure "PASS"
-        | otherwise = do
-            let sz = if nTests <= 1 then maxSz else (idx * maxSz) `quot` max 1 (nTests - 1)
-                usePartial = partPct > 0 && ((idx * 37 + 13) `rem` 100 < partPct)
-                chosenGen = if usePartial then partialGen else totalGen
-                env = runGenAt seed0 idx sz chosenGen
-            res <- testEnv env
-            case res of
-              Nothing -> loop (idx + 1)
-              Just trees0 -> do
-                (shrunkSteps, minEnv, (minL, minR)) <- shrinkLoop 0 env trees0
-                let envStr = showEnv minEnv
-                    bindsPart = if null envStr then "closed sample" else envStr
-                pure $
-                  "FAIL:after "
-                    ++ show (idx + 1)
-                    ++ " test(s)"
-                    ++ (if shrunkSteps > 0 then " and " ++ show shrunkSteps ++ " shrink(s)" else "")
-                    ++ ": "
-                    ++ bindsPart
-                    ++ " gives lhs = "
-                    ++ renderObsTree minL
-                    ++ ", rhs = "
-                    ++ renderObsTree minR
-
-  loop 0
+  verdict <- evalObsVerdict cfg mkEnvGen shrinkEnv approxR evalLhs evalRhs
+  pure $ case verdict of
+    Verified -> "PASS"
+    Inconclusive reason -> "INCONCLUSIVE:" ++ show reason
+    Refuted sampleNum shrunkSteps minEnv minL minR ->
+      let envStr = showEnv minEnv
+          bindsPart = if null envStr then "closed sample" else envStr
+       in "FAIL:after "
+            ++ show sampleNum
+            ++ " test(s)"
+            ++ (if shrunkSteps > 0 then " and " ++ show shrunkSteps ++ " shrink(s)" else "")
+            ++ ": "
+            ++ bindsPart
+            ++ " gives lhs = "
+            ++ renderObsTree minL
+            ++ ", rhs = "
+            ++ renderObsTree minR
 
 -- | Unconstrained 'pure' for 'Gen', used by plugin Core synthesis.
 obsPureGen :: a -> Gen a
@@ -1087,10 +1317,18 @@ obsAppendStr = (++)
 obsAppendList :: [a] -> [a] -> [a]
 obsAppendList = (++)
 
--- | Combine two partiality-parameterized generators into a pair generator.
+-- | Combine two partiality-parameterized generators into a pair generator
+-- with axis-isolated Tier-0 boundary splits.
 obsPairGen :: (Int -> Gen a) -> (Int -> Gen b) -> Int -> Gen (a, b)
-obsPairGen ga gb pct = sized $ \sz ->
-  (,) <$> resize (sz `quot` 2) (ga pct) <*> resize (sz `quot` 2) (gb pct)
+obsPairGen ga gb pct = Gen $ \s sz ->
+  let (s0, sRest) = splitSeed s
+      (s1, s2) = splitSeed sRest
+      (w, _) = stepSeed s0
+      (szA, szB)
+        | sz <= 2 && (w .&. 3 == 1) = (sz, 0)
+        | sz <= 2 && (w .&. 3 == 2) = (0, sz)
+        | otherwise = (sz `quot` 2, sz `quot` 2)
+   in (unGen (ga pct) s1 szA, unGen (gb pct) s2 szB)
 
 -- | Combine two component shrinkers into a pair shrinker.
 obsPairShrink :: (a -> [a]) -> (b -> [b]) -> (a, b) -> [(a, b)]

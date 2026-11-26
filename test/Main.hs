@@ -7,12 +7,17 @@ import Control.Exception ( evaluate )
 import Data.Type.Equality ( (:~:) (Refl), gcastWith, sym )
 import Dependent.ObsEq
   ( Gen
+  , InconclusiveReason (..)
+  , ObsCmp (..)
   , ObsConfig (..)
   , ObsGen (..)
   , ObsTree (..)
+  , ObsVerdict (..)
   , chooseInt
+  , compareObsTree
   , defaultObsConfig
   , evalObsSample
+  , evalObsVerdict
   , freshBottom
   , obsEq
   , obsEqGen
@@ -107,12 +112,9 @@ collatzConverges n = obsEqWith totalCfg
 evenRoundtrip :: foreach (n :: Int) -> twiceHalfEven n :~: n
 evenRoundtrip n = obsEqGen genEvenInt
 
--- 4. Bounded divergence agreement up to micro-timeout.
+-- 4. Diverging timeout produces Inconclusive (never a false nominal equality).
 loopShiftCfg :: ObsConfig
-loopShiftCfg = withTests 6 (withTimeoutUs 1500 defaultObsConfig)
-
-loopShiftObs :: foreach (n :: Nat) -> loopNat n :~: loopNat (Succ n)
-loopShiftObs n = obsEqWith loopShiftCfg
+loopShiftCfg = withTests 4 (withTimeoutUs 1500 defaultObsConfig)
 
 -- Length-indexed vector to test runtime transport via withObsEq and withObsEqWith.
 data Vec a (n :: Nat) where
@@ -163,8 +165,27 @@ main = do
 
   runIntCheck 42
 
-  () <- case (collatzConverges two, loopShiftObs one) of
-    (Refl, Refl) -> pure ()
+  () <- case collatzConverges two of
+    Refl -> pure ()
+
+  let _ = (one, loopNat)
+  vLoop <-
+    evalObsVerdict
+      loopShiftCfg
+      (\_ -> pure Zero)
+      (const [])
+      (\d x -> if d <= 0 then pure ObsCutoff else evaluate x >> pure (ObsCon "Zero" []))
+      (\_ -> spinAlloc 0)
+      (\_ -> spinAlloc 1)
+  if vLoop /= Inconclusive (TimeoutReached 1500)
+    then error ("expected Inconclusive (TimeoutReached 1500), got: " ++ show vLoop)
+    else pure ()
+
+  if compareObsTree 8 1500 ObsCutoff ObsCutoff /= ObsUnknown (DepthCutoffReached 8)
+    || compareObsTree 8 1500 ObsTimedOut ObsTimedOut /= ObsUnknown (TimeoutReached 1500)
+    || compareObsTree 8 1500 (ObsCon "(,)" [ObsCon "Zero" [], ObsCutoff]) (ObsCon "(,)" [ObsCon "Succ" [ObsCutoff], ObsCutoff]) /= ObsApart
+    then error "compareObsTree Kleene lattice check failed"
+    else pure ()
 
   -- Direct library checks: ObsBottom & timeout behavior
   tBottom <- evalObsSample 5000 obsApprox 4 ([1 :: Int, runGenAt 7 1 10 freshBottom] :: [Int])
