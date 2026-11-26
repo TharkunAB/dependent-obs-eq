@@ -1,18 +1,21 @@
 # dependent-obs-eq
 
-`dependent-obs-eq` provides a GHC typechecker plugin (`Dependent.Plugin.ObsEq`) and user combinator library (`Dependent.ObsEq`) for bounded observational-equivalence testing and counterexample refutation in Dependent Haskell (`-XDependentTypes`).
+`dependent-obs-eq` provides a GHC typechecker plugin (`Dependent.Plugin.ObsEq`) and combinator library (`Dependent.ObsEq`) for counterexample refutation and explicit observational-equivalence witnesses in Dependent Haskell (`-XDependentTypes`).
 
 ## Attribution
 
 Based on the observational-equivalence / QuickCheck `TcPlugin` idea proposed by **Jules (@analytichegel)**.
 
-## Overview
+## Scope and Design
 
-In Dependent Haskell, structural functions produce certified closed type-family equations (`SourceTable`). Lazy, partial, accumulator-based, or non-structural functions do not have structural equations. When `-fplugin=Dependent.Plugin.ObsEq` is enabled:
+In Dependent Haskell, structural functions publish certified closed type-family equations (`SourceTable`) that GHC reduces directly. Use inductive proofs or `dependent-proof-search` when structural equations hold deductively. Use `dependent-obs-eq` for two tasks:
 
-1. **Uninterpreted term calls**: GHC elaborates open calls to uncertified functions into stuck closed-family applications instead of rejecting them before constraint solving.
-2. **Automatic counterexample refutation**: On any stuck nominal equality `[W] lhs ~# rhs` over testable domains, the plugin evaluates bounded Kleene approximations over both total and partially defined (`ObsBottom`) inputs. When a sample distinguishes `lhs` and `rhs`, the plugin shrinks the input and reports the minimal counterexample at the source span.
-3. **Explicit observational witnesses (`ExplicitOnly` default)**: `obsEq`, `obsEqWith`, and `obsEqGen` discharge `lhs :~: rhs` when all configured samples agree up to the approximation depth and per-sample timeout. Bare `Refl` remains rejected unless an actual definitional or inductive proof exists (or `policy=assume` is explicitly enabled).
+1. **Automatic counterexample refutation**: When a nominal equality `[W] lhs ~# rhs` gets stuck on open terms, the plugin tests bounded three-valued Kleene approximations (`ObsTree`) over total and partially defined (`ObsBottom`) inputs. When a sample distinguishes `lhs` and `rhs`, the plugin shrinks the input and reports the minimal counterexample at the source span.
+2. **Bridging non-structural equations at transport sites**: Accumulator-passing functions, unfold loops, fuel-free recursion, and abstract container operations do not emit structural `SourceTable` equations. Explicit witnesses (`obsEq`, `checkObsEq`, `obsEqOn`, `obsEqBy`) test the law over configured domains and supply evidence to transport combinators (`castEq`, `usingEq`, `castEqOn`, `liftObsEqOn`).
+
+Before running bytecode samples, the plugin runs a constructive Knuth-Bendix and `SourceTable` completion pass over in-scope Given equalities. When Givens algebraically entail the goal, the plugin emits a pure System FC coercion (`SymCo`, `TransCo`, `TyConAppCo`, `AxiomCo`) with zero `UnivCo` axioms and zero bytecode compilations.
+
+Resource cutoffs (`ObsCutoff`), timeouts and allocation limits (`ObsTimedOut`), double synchronous exceptions (`ObsRaisedSyncError`), and polymorphic class constraints return `Inconclusive` and never emit nominal coercions.
 
 ## Usage
 
@@ -23,25 +26,74 @@ Enable the plugin in a module:
 {-# OPTIONS_GHC -fplugin=Dependent.Plugin.ObsEq #-}
 ```
 
-Prove an observational law explicitly:
+### Value Equality and Zero-Annotation Indexed Transport
+
+Construct witnesses with `obsEq` or `checkObsEq`, and eliminate them with `castEq` or `usingEq`:
 
 ```haskell
 import Data.Type.Equality ((:~:))
-import Dependent.ObsEq (obsEq, obsEqGen, obsEqWith, withTests, defaultObsConfig)
+import Dependent.ObsEq
+  ( castEq
+  , checkObsEq
+  , obsEq
+  , setTests
+  , totalObsConfig
+  )
 
-accPlusLaw :: foreach (m :: Nat) (n :: Nat) -> accPlus m n :~: plus m n
-accPlusLaw m n = obsEq
+unfoldPlusLaw :: foreach (m :: Nat) (n :: Nat) -> unfoldPlus m n :~: plus m n
+unfoldPlusLaw m n = obsEq
+
+fromAccVec
+  :: foreach (m :: Nat) (n :: Nat)
+  -> Vec Int (accPlus m n)
+  -> Vec Int (plus m n)
+fromAccVec m n v = castEq (checkObsEq (setTests 80 totalObsConfig)) v
 ```
 
-Override test parameters per call or pass a custom domain generator:
+When the target type constructor is matchable (such as `Vec Int`), `castEq` infers the context and both endpoints with zero `@` type annotations.
+
+### Preconditions and Invariant-Preserving `ObsDomain` Overrides
+
+State partial-domain preconditions explicitly as Given constraints so invalid call sites fail statically, and guide sampling and shrinking with `forVar` or `forType`:
 
 ```haskell
-evenHalfLaw :: foreach (n :: Int) -> twiceHalf n :~: n
-evenHalfLaw n = obsEqGen genEvenInt
+import Dependent.ObsEq
+  ( ObsDomain
+  , checkObsEq
+  , domainVia
+  , forVar
+  , totalObsConfig
+  )
 
-deepLaw :: foreach (m :: Nat) -> collatzToOne m :~: Succ Zero
-deepLaw m = obsEqWith (withTests 200 defaultObsConfig)
+evenIntDomain :: ObsDomain Int
+evenIntDomain = domainVia (* 2) (`quot` 2)
+
+evenRoundtrip :: foreach (n :: Int) -> (even n ~ True) => twiceHalfEven n :~: n
+evenRoundtrip n = checkObsEq (forVar n evenIntDomain totalObsConfig)
 ```
+
+### Sound Projections (`ObsEquivOn`) and Quotient Lifting (`liftObsEqOn`)
+
+Non-injective projections (such as `toListRB :: RBTree Int -> [Int]`) return `ObsEquivOn proj lhs rhs`, which wraps `proj lhs :~: proj rhs` instead of forging `lhs :~: rhs` on raw internal constructors. Operations that respect canonicalization lift constructively via `liftObsEqOn`:
+
+```haskell
+import Dependent.ObsEq
+  ( ObsEquivOn
+  , checkObsEq
+  , checkObsEqOn
+  , forVar
+  , liftObsEqOn
+  , totalObsConfig
+  )
+
+insertComm
+  :: foreach (x :: Int) (y :: Int) (t :: RBTree Int)
+  -> (isValidBST t ~ True)
+  => ObsEquivOn toListRB (insertRB x (insertRB y t)) (insertRB y (insertRB x t))
+insertComm x y t = checkObsEqOn (forVar t rbDomain totalObsConfig) toListRB
+```
+
+Boolean equivalence relations (`obsEqBy`, `checkObsEqBy`) return `ObsEquivBy rel lhs rhs` (`rel lhs rhs :~: True`) after verifying primary truth alongside endpoint reflexivity and symmetry.
 
 ## Plugin Options
 
@@ -51,10 +103,10 @@ Pass options with `-fplugin-opt=Dependent.Plugin.ObsEq:<option>`:
 | --- | --- | --- |
 | `tests=N` | `100` | Number of test samples per constraint |
 | `max-size=S` | `20` | Maximum generator size parameter |
-| `approx-depth=D` | `8` | Bounded Kleene constructor-tree depth |
+| `approx-depth=D` | `100` | Bounded Kleene constructor-tree depth |
 | `partial-pct=P` | `25` | Percentage of samples seeded with `ObsBottom` thunks |
 | `timeout-us=T` | `10000` | Microsecond timeout per side per sample |
 | `seed=K` | `0` | Deterministic starting PRNG seed |
-| `policy=explicit\|assume` | `explicit` | Keep bare `Refl` conservative (`explicit`) or discharge passing nominal equalities (`assume`) |
+| `policy=refute-only\|explicit\|assume` | `explicit` | Refute and prove constructively only (`refute-only`), also discharge explicit witnesses (`explicit`), or also discharge bare nominal equalities (`assume`) |
 
-Same-module functions run as bytecode inside `hscInterp` and yield on every jump. When testing precompiled external modules that may enter zero-allocation infinite loops, compile those provider modules with `-fno-omit-yields` so `System.Timeout.timeout` can preempt them cleanly.
+Same-module functions run as bytecode inside `hscInterp` and yield on every jump. Each sample also runs under a 64 MiB thread-local allocation limit. When testing precompiled external modules that may enter zero-allocation infinite loops, compile those provider modules with `-fno-omit-yields` so `System.Timeout.timeout` preempts them cleanly.

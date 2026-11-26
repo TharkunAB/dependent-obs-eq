@@ -1,199 +1,492 @@
-{-# LANGUAGE DependentTypes, ListTuplePuns #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DependentTypes #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE ListTuplePuns #-}
 {-# OPTIONS_GHC -fplugin=Dependent.Plugin.ObsEq #-}
 
-module Main (main) where
+module Main (main, evenRoundtrip) where
 
-import Control.Exception ( evaluate )
-import Data.Type.Equality ( (:~:) (Refl), gcastWith, sym )
+import Control.Exception ( TypeError (..), evaluate, try )
+import Data.List ( isInfixOf, isPrefixOf )
+import Data.Type.Equality ( (:~:) (Refl) )
 import Dependent.ObsEq
   ( Gen
+  , GuardResult (..)
   , InconclusiveReason (..)
   , ObsCmp (..)
   , ObsConfig (..)
+  , ObsEquivBy (..)
+  , ObsEquivOn (..)
   , ObsGen (..)
   , ObsTree (..)
-  , ObsVerdict (..)
-  , chooseInt
+  , castEq
+  , castEqOn
+  , checkObsEq
+  , checkObsEqBy
+  , checkObsEqOn
   , compareObsTree
   , defaultObsConfig
   , evalObsSample
-  , evalObsVerdict
+  , forType
+  , forVar
   , freshBottom
+  , liftObsEqOn
   , obsEq
-  , obsEqGen
-  , obsEqWith
+  , obsEqBy
+  , obsEqOn
+  , reflObsOn
   , runGenAt
-  , withObsEq
-  , withObsEqWith
-  , withPartialPct
-  , withTests
-  , withTimeoutUs
+  , runObsByLoop
+  , runObsOnLoop
+  , runObsTestLoop
+  , setApproxDepth
+  , setPartialPct
+  , setTests
+  , symObsOn
+  , totalObsConfig
+  , transObsOn
+  , usingEq
+  )
+import Dependent.Plugin.ObsEq
+  ( DischargePolicy (..)
+  , PluginOpts (..)
+  , parsePluginOpts
   )
 
-data Nat = Zero | Succ Nat
-  deriving (Eq, Show)
+import DeferredNegatives
+  ( badDepthCutoff
+  , badEvenCallOdd
+  , badFalsePlusSwap
+  , badImpossibleGuard
+  , badLoopTimeout
+  , badNonSymRel
+  , badParametricListRefuted
+  , badRootKeyCanon
+  , badStrictByPartial
+  , badUnguardedSubset
+  )
+import DeferredRefuteOnly
+  ( badExplicitUnderRefuteOnly
+  , constructiveUnderRefuteOnly
+  )
+import Defs
+  ( Nat (..)
+  , RBTree (..)
+  , TaggedNat (..)
+  , Vec (..)
+  , accPlus
+  , collatz
+  , deepNat12
+  , emptyRB
+  , eqMod2Nat
+  , evenIntDomain
+  , evenNatDomain
+  , fromListRB
+  , insertRB
+  , isEvenInt
+  , isEvenNat
+  , isValidBST
+  , leNat
+  , plus
+  , rbDomain
+  , rootKey
+  , sameTagPair
+  , sizeRB
+  , spinAlloc
+  , toListRB
+  , twiceHalfEven
+  , twiceHalfNat
+  , unfoldPlus
+  , vToList
+  )
 
-plus :: Nat -> Nat -> Nat
-plus Zero n = n
-plus (Succ m) n = Succ (plus m n)
-
--- Non-structural unfold addition (lazy-equivalent to plus on partial spines).
-unfoldPlus :: Nat -> Nat -> Nat
-unfoldPlus m n = step (Just m) n
-  where
-    step Nothing acc = acc
-    step (Just Zero) acc = step Nothing acc
-    step (Just (Succ k)) acc = Succ (step (Just k) acc)
-
--- Non-structural accumulator addition (total-domain equivalent to plus).
-accPlus :: Nat -> Nat -> Nat
-accPlus m n = go m n
-  where
-    go Zero acc = acc
-    go (Succ k) acc = go k (Succ acc)
-
--- Non-structural fuel-free Collatz convergence on total Nats.
-collatz :: Nat -> Nat
-collatz Zero = Succ Zero
-collatz (Succ Zero) = Succ Zero
-collatz n
-  | isEvenNat n = collatz (halfNat n)
-  | otherwise = collatz (Succ (tripleNat n))
-
-isEvenNat :: Nat -> Bool
-isEvenNat Zero = True
-isEvenNat (Succ Zero) = False
-isEvenNat (Succ (Succ n)) = isEvenNat n
-
-halfNat :: Nat -> Nat
-halfNat Zero = Zero
-halfNat (Succ Zero) = Zero
-halfNat (Succ (Succ n)) = Succ (halfNat n)
-
-tripleNat :: Nat -> Nat
-tripleNat Zero = Zero
-tripleNat (Succ n) = Succ (Succ (Succ (tripleNat n)))
-
--- Domain-restricted function: identity on even Ints, fails on odd Ints.
-twiceHalfEven :: Int -> Int
-twiceHalfEven n
-  | even n = (n `quot` 2) * 2
-  | otherwise = error "twiceHalfEven: odd input"
-
-genEvenInt :: Gen Int
-genEvenInt = (* 2) <$> chooseInt (-50, 50)
-
--- Diverging function for compile-time bytecode timeout testing.
-loopNat :: Nat -> Nat
-loopNat n = loopNat (Succ n)
-
--- Allocating diverging function for native -O2 runtime evalObsSample testing
--- (native -O2 compiles non-allocating loops without heap checks unless -fno-omit-yields is set).
-spinAlloc :: Integer -> Nat
-spinAlloc k
-  | k < 0 = Zero
-  | otherwise = spinAlloc (k + 1)
+-- ---------------------------------------------------------------------------
+-- 1. Pillar 1: Value Witnesses & Zero-Annotation Eliminators (castEq / usingEq)
+-- ---------------------------------------------------------------------------
 
 totalCfg :: ObsConfig
-totalCfg = withPartialPct 0 (withTests 80 defaultObsConfig)
+totalCfg = setTests 80 totalObsConfig
 
--- 1. Non-structural unfold proved equal to structural spec via default obsEq (including partial spines).
+-- | Default 'obsEq' verifies lazy equivalence (including partial 'ObsBottom' spines).
 unfoldPlusCorrect :: foreach (m :: Nat) (n :: Nat) -> unfoldPlus m n :~: plus m n
-unfoldPlusCorrect m n = obsEq
+unfoldPlusCorrect _m _n = obsEq
 
--- 2. Non-structural accumulator & Collatz proved on total Nats via obsEqWith.
+-- | Multiple independent explicit goals in one module to exercise per-module
+-- desugar caching, De Bruijn GoalVerdictCache, and batched BCO evaluation.
+batchLaw1, batchLaw2 :: foreach (m :: Nat) (n :: Nat) -> unfoldPlus m n :~: plus m n
+batchLaw1 _m _n = obsEq
+batchLaw2 _m _n = obsEq
+
+batchLaw3 :: foreach (m :: Nat) -> accPlus m Zero :~: m
+batchLaw3 _m = checkObsEq totalCfg
 accPlusCorrect :: foreach (m :: Nat) (n :: Nat) -> accPlus m n :~: plus m n
-accPlusCorrect m n = obsEqWith totalCfg
+accPlusCorrect _m _n = checkObsEq totalCfg
+
+plusComm :: foreach (m :: Nat) (n :: Nat) -> plus m n :~: plus n m
+plusComm _m _n = checkObsEq totalCfg
 
 collatzConverges :: foreach (n :: Nat) -> collatz n :~: Succ Zero
-collatzConverges n = obsEqWith totalCfg
+collatzConverges _n = checkObsEq totalCfg
 
--- 3. Custom generator combinator obsEqGen on even Ints.
-evenRoundtrip :: foreach (n :: Int) -> twiceHalfEven n :~: n
-evenRoundtrip n = obsEqGen genEvenInt
-
--- 4. Diverging timeout produces Inconclusive (never a false nominal equality).
-loopShiftCfg :: ObsConfig
-loopShiftCfg = withTests 4 (withTimeoutUs 1500 defaultObsConfig)
-
--- Length-indexed vector to test runtime transport via withObsEq and withObsEqWith.
-data Vec a (n :: Nat) where
-  VNil :: Vec a Zero
-  VCons :: a -> Vec a n -> Vec a (Succ n)
-
-vToList :: Vec a n -> [a]
-vToList VNil = []
-vToList (VCons x xs) = x : vToList xs
-
+-- | Zero-annotation indexed transport via 'castEq' + 'obsEq'.
 toUnfoldVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (plus m n) -> Vec Int (unfoldPlus m n)
-toUnfoldVec m n v = withObsEq @(plus m n) @(unfoldPlus m n) @(Vec Int (unfoldPlus m n)) v
+toUnfoldVec _m _n v = castEq obsEq v
 
 fromUnfoldVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (unfoldPlus m n) -> Vec Int (plus m n)
-fromUnfoldVec m n v = case sym (unfoldPlusCorrect m n) of
-  Refl -> v
+fromUnfoldVec m n v = castEq (unfoldPlusCorrect m n) v
 
-roundtripUnfoldVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (plus m n) -> Vec Int (plus m n)
-roundtripUnfoldVec m n v = fromUnfoldVec m n (toUnfoldVec m n v)
-
+-- | Zero-annotation indexed transport via 'castEq' + 'checkObsEq'.
 toAccVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (plus m n) -> Vec Int (accPlus m n)
-toAccVec m n v = gcastWith (obsEqWith totalCfg :: plus m n :~: accPlus m n) v
+toAccVec _m _n v = castEq (checkObsEq totalCfg) v
 
+-- | Scope eliminator 'usingEq'.
 fromAccVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (accPlus m n) -> Vec Int (plus m n)
-fromAccVec m n v = withObsEqWith totalCfg @(accPlus m n) @(plus m n) @(Vec Int (plus m n)) v
+fromAccVec m n v = usingEq (accPlusCorrect m n) v
 
-roundtripAccVec :: foreach (m :: Nat) (n :: Nat) -> Vec Int (plus m n) -> Vec Int (plus m n)
-roundtripAccVec m n v = fromAccVec m n (toAccVec m n v)
+-- ---------------------------------------------------------------------------
+-- 2. Constructive Zero-UnivCo Knuth-Bendix Proofs on Bare 'Refl'
+-- ---------------------------------------------------------------------------
 
-runIntCheck :: Int -> IO ()
-runIntCheck e =
-  case evenRoundtrip e of
-    Refl -> pure ()
+-- | Discharged constructively by 'Dependent.Plugin.ObsEq.Rewrite' under
+-- ExplicitOnly without 'obsEq' and without BCO compilation!
+kboCongSwap
+  :: foreach (m :: Nat) (n :: Nat)
+  -> (accPlus m n ~ plus m n)
+  => Succ (accPlus m n) :~: plus (Succ m) n
+kboCongSwap _m _n = Refl
+
+-- | Unfailing KB chain: @a ~ b@ and @b ~ c@ oriented by KBO discharge @f a ~ f c@
+-- on bare 'Refl'.
+kboTransChain
+  :: foreach (x :: Nat) (y :: Nat) (z :: Nat)
+  -> (unfoldPlus x y ~ accPlus x y, plus x y ~ accPlus x y)
+  => Succ (unfoldPlus x y) :~: Succ (plus x y)
+kboTransChain _x _y _z = Refl
+
+-- ---------------------------------------------------------------------------
+-- 3. Pillar 3: Guarded Preconditions + forVar / forType ObsDomain Overrides
+-- ---------------------------------------------------------------------------
+
+evenRoundtrip :: foreach (n :: Int) -> (isEvenInt n ~ True) => twiceHalfEven n :~: n
+evenRoundtrip n = checkObsEq (forVar n evenIntDomain totalObsConfig)
+
+evenNatRoundtrip :: foreach (n :: Nat) -> (isEvenNat n ~ True) => twiceHalfNat n :~: n
+evenNatRoundtrip n = checkObsEq (forVar n evenNatDomain totalObsConfig)
+
+validEmptyBST :: foreach (t :: RBTree Nat) -> (t ~ E) => isValidBST t :~: True
+validEmptyBST _t = checkObsEq totalObsConfig
+
+runRBSuite :: Nat -> Nat -> IO ()
+runRBSuite x y =
+  case validEmptyBST E of
+    Refl -> do
+      () <- case projectEq (insertComm x y E) of Refl -> pure ()
+      () <- case sizeInsertComm x y E of Refl -> pure ()
+      let AscTag tagVal = castProjectedTag x y E (AscTag 99)
+      assert "castEqOn preserves payload" (tagVal == 99)
+
+-- ---------------------------------------------------------------------------
+-- 4. Pillar 2: Sound Projections (ObsEquivOn / liftObsEqOn) & Relations (ObsEquivBy)
+-- ---------------------------------------------------------------------------
+
+insertPreservesBST
+  :: foreach (x :: Nat) (t :: RBTree Nat)
+  -> (isValidBST t ~ True)
+  => isValidBST (insertRB x t) :~: True
+insertPreservesBST _x t = checkObsEq (forVar t rbDomain (setTests 60 totalObsConfig))
+
+sizeCanon
+  :: foreach (t :: RBTree Nat)
+  -> (isValidBST t ~ True)
+  => sizeRB (fromListRB (toListRB t)) :~: sizeRB t
+sizeCanon t = checkObsEq (forVar t rbDomain (setTests 60 totalObsConfig))
+
+-- | Commutativity of BST insertion up to 'toListRB' using 'forType'.
+insertComm
+  :: foreach (x :: Nat) (y :: Nat) (t :: RBTree Nat)
+  -> (isValidBST t ~ True)
+  => ObsEquivOn toListRB (insertRB x (insertRB y t)) (insertRB y (insertRB x t))
+insertComm _x _y _t = checkObsEqOn (forType rbDomain (setTests 60 totalObsConfig)) toListRB
+
+-- | Lazy default 'obsEqOn' on structural parity projection.
+unfoldIdObsOn
+  :: foreach (m :: Nat) (n :: Nat)
+  -> ObsEquivOn isEvenNat (unfoldPlus m n) (plus m n)
+unfoldIdObsOn _m _n = obsEqOn isEvenNat
+
+reflParityZero :: ObsEquivOn isEvenNat Zero Zero
+reflParityZero = reflObsOn
+
+-- | Quotient lifting via 'liftObsEqOn': lifts 'insertComm' through 'sizeRB'
+-- using verified canonicalization witnesses without forging @t1 :~: t2@!
+sizeInsertComm
+  :: foreach (x :: Nat) (y :: Nat) (t :: RBTree Nat)
+  -> (isValidBST t ~ True)
+  => sizeRB (insertRB x (insertRB y t)) :~: sizeRB (insertRB y (insertRB x t))
+sizeInsertComm x y t =
+  case insertPreservesBST y t of
+    Refl -> case insertPreservesBST x (insertRB y t) of
+      Refl -> case insertPreservesBST x t of
+        Refl -> case insertPreservesBST y (insertRB x t) of
+          Refl ->
+            liftObsEqOn
+              fromListRB
+              sizeRB
+              (sizeCanon (insertRB x (insertRB y t)))
+              (sizeCanon (insertRB y (insertRB x t)))
+              (insertComm x y t)
+
+newtype AscTag (xs :: [Nat]) = AscTag Int
+
+castProjectedTag
+  :: foreach (x :: Nat) (y :: Nat) (t :: RBTree Nat)
+  -> (isValidBST t ~ True)
+  => AscTag (toListRB (insertRB x (insertRB y t)))
+  -> AscTag (toListRB (insertRB y (insertRB x t)))
+castProjectedTag x y t tag =
+  let eq1 = insertComm x y t
+   in castEqOn (transObsOn eq1 (transObsOn (symObsOn eq1) eq1)) tag
+
+-- | Equivalence-relation witnesses ('checkObsEqBy' and 'obsEqBy').
+mod2DoubleZero :: foreach (n :: Nat) -> ObsEquivBy eqMod2Nat (plus n n) Zero
+mod2DoubleZero _n = checkObsEqBy totalCfg eqMod2Nat
+
+tagUnfoldObsBy
+  :: foreach (m :: Nat) (n :: Nat)
+  -> ObsEquivBy sameTagPair (MkTaggedNat True (unfoldPlus m n)) (MkTaggedNat True (plus m n))
+tagUnfoldObsBy _m _n = obsEqBy sameTagPair
+
+-- ---------------------------------------------------------------------------
+-- Runtime Verification Helpers
+-- ---------------------------------------------------------------------------
+
+assert :: String -> Bool -> IO ()
+assert label ok
+  | ok = pure ()
+  | otherwise = error ("Assertion failed: " ++ label)
+
+assertDeferredTypeError :: String -> a -> IO ()
+assertDeferredTypeError label thunk = do
+  res <- try @TypeError (evaluate thunk)
+  case res of
+    Left (TypeError msg) ->
+      assert (label ++ " non-empty message") (not (null msg))
+    Right _ ->
+      error ("Expected deferred TypeError for '" ++ label ++ "', but evaluation succeeded!")
+
+oneNat :: Nat
+oneNat = Succ Zero
+
+twoNat :: Nat
+twoNat = Succ (Succ Zero)
+
+vecSampleA :: Vec Int (Succ (Succ (Succ Zero)))
+vecSampleA = VCons 1 (VCons 2 (VCons 3 VNil))
+
+vecSampleB :: Vec Int (Succ (Succ (Succ Zero)))
+vecSampleB = VCons 10 (VCons 20 (VCons 30 VNil))
 
 main :: IO ()
 main = do
-  let two = Succ (Succ Zero)
-      one = Succ Zero
-      vecA :: Vec Int (Succ (Succ (Succ Zero)))
-      vecA = VCons 1 (VCons 2 (VCons 3 VNil))
-      vecB :: Vec Int (Succ (Succ (Succ Zero)))
-      vecB = VCons 10 (VCons 20 (VCons 30 VNil))
+  -- 1. Transported vectors (castEq + obsEq / checkObsEq + usingEq)
+  assert
+    "roundtripUnfoldVec"
+    ( vToList
+        ( fromUnfoldVec
+            (Succ (Succ Zero))
+            (Succ Zero)
+            (toUnfoldVec (Succ (Succ Zero)) (Succ Zero) vecSampleA)
+        )
+        == [1, 2, 3]
+    )
+  assert
+    "roundtripAccVec"
+    ( vToList
+        ( fromAccVec
+            (Succ (Succ Zero))
+            (Succ Zero)
+            (toAccVec (Succ (Succ Zero)) (Succ Zero) vecSampleB)
+        )
+        == [10, 20, 30]
+    )
 
-  if vToList (roundtripUnfoldVec (Succ (Succ Zero)) (Succ Zero) vecA) /= [1, 2, 3]
-    || vToList (roundtripAccVec (Succ (Succ Zero)) (Succ Zero) vecB) /= [10, 20, 30]
-    then error "transportVec failed"
-    else pure ()
+  -- 1b. Batched BCO & GoalVerdictCache witnesses
+  () <- case (batchLaw1 twoNat oneNat, batchLaw2 oneNat twoNat, batchLaw3 twoNat) of
+    (Refl, Refl, Refl) -> pure ()
 
-  runIntCheck 42
+  -- 2. Collatz & guarded evenRoundtrip
+  () <- case collatzConverges twoNat of Refl -> pure ()
+  () <- case evenNatRoundtrip (Succ (Succ Zero)) of Refl -> pure ()
 
-  () <- case collatzConverges two of
-    Refl -> pure ()
+  -- 3. Constructive KBO proofs (both ExplicitOnly and RefuteOnly!)
+  () <- case accPlusCorrect twoNat oneNat of
+    Refl -> case kboCongSwap twoNat oneNat of Refl -> pure ()
+  () <- case plusComm twoNat oneNat of
+    Refl -> case constructiveUnderRefuteOnly twoNat oneNat of Refl -> pure ()
+  () <- case (unfoldPlusCorrect twoNat oneNat, accPlusCorrect twoNat oneNat) of
+    (Refl, Refl) -> case kboTransChain twoNat oneNat Zero of Refl -> pure ()
 
-  let _ = (one, loopNat)
-  vLoop <-
-    evalObsVerdict
-      loopShiftCfg
+  -- 4. Colored BST ObsEquivOn, castEqOn, and liftObsEqOn
+  assert
+    "distinct internal rootKeys"
+    ( rootKey (insertRB oneNat (insertRB twoNat emptyRB))
+        /= rootKey (insertRB twoNat (insertRB oneNat emptyRB))
+        && toListRB (insertRB oneNat (insertRB twoNat emptyRB))
+          == toListRB (insertRB twoNat (insertRB oneNat emptyRB))
+        && sizeRB (insertRB twoNat (insertRB oneNat emptyRB)) == twoNat
+    )
+  () <- case projectEq (unfoldIdObsOn twoNat oneNat) of Refl -> pure ()
+  () <- case projectEq reflParityZero of Refl -> pure ()
+  runRBSuite twoNat oneNat
+
+  -- 5. Equivalence relation ObsEquivBy
+  () <- case relEqTrue (mod2DoubleZero twoNat) of Refl -> pure ()
+  () <- case relEqTrue (tagUnfoldObsBy twoNat oneNat) of Refl -> pure ()
+
+  -- 6. Compile-time negative tests (via -fdefer-type-errors) MUST all raise TypeError!
+  assertDeferredTypeError "badRootKeyCanon" badRootKeyCanon
+  assertDeferredTypeError "badEvenCallOdd" badEvenCallOdd
+  assertDeferredTypeError "badUnguardedSubset" (badUnguardedSubset 1)
+  assertDeferredTypeError "badNonSymRel" badNonSymRel
+  assertDeferredTypeError "badStrictByPartial" badStrictByPartial
+  assertDeferredTypeError "badLoopTimeout" badLoopTimeout
+  assertDeferredTypeError "badDepthCutoff" badDepthCutoff
+  assertDeferredTypeError "badImpossibleGuard" badImpossibleGuard
+  assertDeferredTypeError "badParametricListRefuted" badParametricListRefuted
+  assertDeferredTypeError "badFalsePlusSwap" badFalsePlusSwap
+  assertDeferredTypeError "badExplicitUnderRefuteOnly" badExplicitUnderRefuteOnly
+
+  -- 7. Direct runtime verification of Kleene lattice, coupled shrinking, and diagnostics
+  assert
+    "compareObsTree Kleene lattice"
+    ( compareObsTree 8 1500 ObsCutoff ObsCutoff == ObsUnknown (DepthCutoffReached 8)
+        && compareObsTree 8 1500 ObsTimedOut ObsTimedOut == ObsUnknown (TimeoutReached 1500)
+        && compareObsTree 8 1500 ObsRaisedSyncError ObsRaisedSyncError == ObsUnknown SyncExceptionRaised
+        && compareObsTree 8 1500 (ObsRaisedBottom 7) (ObsRaisedBottom 7) == ObsEqual
+        && compareObsTree 8 1500 (ObsRaisedBottom 7) (ObsRaisedBottom 8) == ObsApart
+        && compareObsTree 8 1500 (ObsCon "(,)" [ObsCon "Zero" [], ObsCutoff]) (ObsCon "(,)" [ObsCon "Succ" [ObsCutoff], ObsCutoff]) == ObsApart
+    )
+
+  -- Coupled 4x4 diagonal shrinking: guard x == y with failure at x >= 2 && y >= 2
+  -- Axis-only shrinks break x == y; 4x4 diagonal shrinks (10, 10) down to (2, 2)!
+  coupledOut <-
+    runObsTestLoop
+      (setTests 60 totalObsConfig)
+      Nothing
+      (\(x, y) -> pure (if x == y then GuardHolds else GuardFails))
+      (\_ -> (\k -> (k, k)) <$> obsGen)
+      (\(x, y) ->
+        let xs = obsShrink (x :: Int)
+            ys = obsShrink (y :: Int)
+         in [(x', y) | x' <- xs]
+              ++ [(x, y') | y' <- ys]
+              ++ [(x', y') | x' <- take 4 xs, y' <- take 4 ys]
+      )
+      (\(x, y) -> "x = " ++ show x ++ ", y = " ++ show y)
+      obsApprox
+      (\(x, y) -> x >= 2 && y >= 2)
+      (const False)
+  assert
+    ("coupled shrink reaches (2, 2), got: " ++ coupledOut)
+    ("x = 2, y = 2" `isInfixOf` coupledOut)
+
+  -- InsufficientPreconditionHits when guard never holds
+  insuffOut <-
+    runObsTestLoop
+      (setTests 5 totalObsConfig)
+      Nothing
+      (const (pure GuardFails))
+      (\_ -> obsGen :: Gen Int)
+      obsShrink
+      show
+      obsApprox
+      id
+      id
+  assert
+    ("insufficient precondition hits, got: " ++ insuffOut)
+    (insuffOut == "INCONCLUSIVE:InsufficientPreconditionHits 0 5")
+
+  -- Depth cutoff in runObsTestLoop
+  cutoffOut <-
+    runObsTestLoop
+      (setTests 4 (setApproxDepth 8 totalObsConfig))
+      Nothing
+      (const (pure GuardHolds))
       (\_ -> pure Zero)
       (const [])
-      (\d x -> if d <= 0 then pure ObsCutoff else evaluate x >> pure (ObsCon "Zero" []))
-      (\_ -> spinAlloc 0)
-      (\_ -> spinAlloc 1)
-  if vLoop /= Inconclusive (TimeoutReached 1500)
-    then error ("expected Inconclusive (TimeoutReached 1500), got: " ++ show vLoop)
-    else pure ()
+      show
+      (\d n ->
+        let walk 0 _ = pure ObsCutoff
+            walk _ Zero = pure (ObsCon "Zero" [])
+            walk k (Succ m) = (\t -> ObsCon "Succ" [t]) <$> walk (k - 1) m
+         in walk d n
+      )
+      deepNat12
+      (deepNat12 . Succ)
+  assert
+    ("depth cutoff inconclusive, got: " ++ cutoffOut)
+    (cutoffOut == "INCONCLUSIVE:DepthCutoffReached 8")
 
-  if compareObsTree 8 1500 ObsCutoff ObsCutoff /= ObsUnknown (DepthCutoffReached 8)
-    || compareObsTree 8 1500 ObsTimedOut ObsTimedOut /= ObsUnknown (TimeoutReached 1500)
-    || compareObsTree 8 1500 (ObsCon "(,)" [ObsCon "Zero" [], ObsCutoff]) (ObsCon "(,)" [ObsCon "Succ" [ObsCutoff], ObsCutoff]) /= ObsApart
-    then error "compareObsTree Kleene lattice check failed"
-    else pure ()
+  -- Projection counterexample format ("proj lhs = ..., proj rhs = ...")
+  projFailOut <-
+    runObsOnLoop
+      (setTests 20 totalObsConfig)
+      Nothing
+      (const (pure GuardHolds))
+      (\_ -> obsGen)
+      obsShrink
+      (\n -> "n = " ++ show n)
+      obsApprox
+      (`mod` (2 :: Int))
+      id
+      (+ 1)
+  assert
+    ("proj counterexample diagnostic, got: " ++ projFailOut)
+    ("FAIL:" `isPrefixOf` projFailOut && "proj lhs =" `isInfixOf` projFailOut)
 
-  -- Direct library checks: ObsBottom & timeout behavior
+  -- Relation symmetry failure format ("failed symmetry")
+  bySymOut <-
+    runObsByLoop
+      (setTests 10 totalObsConfig)
+      Nothing
+      (const (pure GuardHolds))
+      (\_ -> pure Zero)
+      (const [])
+      (\n -> "n = " ++ show n)
+      "leNat"
+      leNat
+      (const Zero)
+      Succ
+  assert
+    ("by symmetry diagnostic, got: " ++ bySymOut)
+    ("FAIL:relation 'leNat' failed symmetry" `isPrefixOf` bySymOut)
+
+  -- Partial demand probe & native timeout checks
   tBottom <- evalObsSample 5000 obsApprox 4 ([1 :: Int, runGenAt 7 1 10 freshBottom] :: [Int])
   case tBottom of
     ObsCon ":" [ObsCon "1" [], ObsCon ":" [ObsRaisedBottom _, ObsCon "[]" []]] -> pure ()
     other -> error ("unexpected partial tree: " ++ show other)
 
-  tTimeout <- evalObsSample 1500 (\d x -> if d <= 0 then pure ObsCutoff else evaluate x >> pure (ObsCon "Zero" [])) 4 (spinAlloc 0)
-  if tTimeout /= ObsTimedOut
-    then error ("expected ObsTimedOut, got: " ++ show tTimeout)
-    else putStrLn "dependent-obs-eq-test: OK"
+  tTimeout <-
+    evalObsSample
+      1500
+      (\d x -> if d <= 0 then pure ObsCutoff else evaluate x >> pure (ObsCon "Zero" []))
+      4
+      (spinAlloc 0)
+  assert ("expected ObsTimedOut, got: " ++ show tTimeout) (tTimeout == ObsTimedOut)
+
+  -- Plugin CLI option parser check (including policy=refute-only and default depth 100)
+  assert
+    "parsePluginOpts policy=refute-only"
+    ( parsePluginOpts ["policy=refute-only,tests=42"]
+        == Right
+          PluginOpts
+            { poConfig = (setTests 42 defaultObsConfig)
+            , poPolicy = RefuteOnly
+            , poWarnAssume = False
+            }
+        && obsApproxDepth defaultObsConfig == 100
+        && obsPartialPct (setPartialPct 0 defaultObsConfig) == obsPartialPct totalObsConfig
+    )
+
+  putStrLn "dependent-obs-eq-test: OK"

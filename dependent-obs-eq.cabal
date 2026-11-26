@@ -1,17 +1,20 @@
 cabal-version: 3.4
 name: dependent-obs-eq
-version: 0.1.0.0
+version: 0.2.0.0
 synopsis: Observational-equivalence typechecker plugin for Dependent Haskell
 description:
   @dependent-obs-eq@ provides a GHC typechecker plugin ('Dependent.Plugin.ObsEq')
-  and user combinator library ('Dependent.ObsEq') that test and discharge
-  observational type equalities in Dependent Haskell (@-XDependentTypes@).
+  and combinator library ('Dependent.ObsEq') for counterexample refutation and
+  explicit observational-equivalence witnesses in Dependent Haskell
+  (@-XDependentTypes@).
   .
-  The plugin evaluates open type-level expressions over generated total and
-  partially defined ('ObsBottom') inputs, compares bounded constructor trees up
-  to a configurable Kleene approximation depth with per-sample microsecond
-  timeouts, shrinks falsifying inputs to minimal counterexamples, and discharges
-  explicit observational witnesses ('obsEq', 'obsEqWith', 'obsEqGen').
+  The plugin discharges constructive algebraic consequences of Given equalities
+  via Knuth-Bendix completion without bytecode evaluation, refutes false stuck
+  equalities with shrunk counterexamples, evaluates strong three-valued Kleene
+  approximations ('ObsTree') over total and partial ('ObsBottom') inputs, and
+  discharges explicit value, projection, and equivalence-relation witnesses
+  ('obsEq', 'checkObsEq', 'obsEqOn', 'obsEqBy', 'castEq', 'usingEq',
+  'liftObsEqOn') over configurable 'ObsDomain' generators.
   .
   Based on the observational-equivalence / QuickCheck @TcPlugin@ idea proposed
   by Jules (\@analytichegel).
@@ -45,6 +48,8 @@ library
     Dependent.Plugin.ObsEq
 
   other-modules:
+    Dependent.ObsEq.Domain
+    Dependent.ObsEq.Internal
     Dependent.Plugin.ObsEq.Rewrite
 
   build-depends:
@@ -58,6 +63,12 @@ test-suite dependent-obs-eq-test
   type: exitcode-stdio-1.0
   hs-source-dirs: test
   main-is: Main.hs
+  ghc-options: -dynamic-too
+  other-modules:
+    DeferredNegatives
+    DeferredRefuteOnly
+    Defs
+
   build-depends:
     base,
     dependent-obs-eq,
