@@ -3,55 +3,58 @@
 {-# LANGUAGE FieldSelectors #-}
 {-# LANGUAGE TypeFamilies #-}
 
--- |
--- Module      : Dependent.ObsEq.Internal
--- Description : Configuration types and modifiers for Dependent.ObsEq
--- License     : BSD-3-Clause
--- Maintainer  : mpg@mpg.is
---
--- Scalar configuration record, stuck 'DefaultObsConfig' marker family, and
--- modifiers for "Dependent.ObsEq".
-module Dependent.ObsEq.Internal
-  ( ObsConfig (..)
-  , DefaultObsConfig
-  , defaultObsConfig
-  , totalObsConfig
-  , setTests
-  , setMaxSize
-  , setApproxDepth
-  , setPartialPct
-  , setTimeoutUs
-  , setSeed
-  ) where
+{- |
+Module      : Dependent.ObsEq.Internal
+Description : Configuration types and modifiers for Dependent.ObsEq
+License     : BSD-3-Clause
+Maintainer  : mpg@mpg.is
 
-import Numeric.Natural ( Natural )
+Scalar configuration record, stuck 'DefaultObsConfig' marker family, and
+modifiers for "Dependent.ObsEq".
+-}
+module Dependent.ObsEq.Internal (
+    ObsConfig (..),
+    DefaultObsConfig,
+    defaultObsConfig,
+    totalObsConfig,
+    setTests,
+    setMaxSize,
+    setApproxDepth,
+    setPartialPct,
+    setTimeoutUs,
+    setSeed,
+) where
+
+import Numeric.Natural (Natural)
 
 -- | Scalar parameters for bounded observational-equivalence testing.
 data ObsConfig = ObsConfig
-  { obsTests :: Natural
-  -- ^ Number of test samples to run (default: @100@).
-  , obsMaxSize :: Natural
-  -- ^ Maximum generator size parameter (default: @20@).
-  , obsApproxDepth :: Natural
-  -- ^ Maximum constructor-tree approximation depth (default: @100@).
-  , obsPartialPct :: Natural
-  -- ^ Percentage @[0..100]@ of samples that inject @ObsBottom@ thunks (default: @25@).
-  , obsTimeoutUs :: Natural
-  -- ^ Per-side evaluation timeout in microseconds (default: @10000@).
-  , obsSeed :: Natural
-  -- ^ Deterministic starting PRNG seed (default: @0@).
-  }
-  deriving (Eq, Ord, Show, Read)
+    { obsTests :: Natural
+    -- ^ Number of test samples to run (default: @100@).
+    , obsMaxSize :: Natural
+    -- ^ Maximum generator size parameter (default: @20@).
+    , obsApproxDepth :: Natural
+    -- ^ Maximum constructor-tree approximation depth (default: @100@).
+    , obsPartialPct :: Natural
+    -- ^ Percentage @[0..100]@ of samples that inject @ObsBottom@ thunks (default: @25@).
+    , obsTimeoutUs :: Natural
+    -- ^ Per-side evaluation timeout in microseconds (default: @10000@).
+    , obsSeed :: Natural
+    -- ^ Deterministic starting PRNG seed (default: @0@).
+    }
+    deriving (Eq, Ord, Show, Read)
 
--- | Stuck closed type family representing the active plugin configuration
--- ('defaultObsConfig' overridden by any CLI @-fplugin-opt@ flags) inside
--- 'Dependent.ObsEq.obsEq', 'Dependent.ObsEq.obsEqOn', and
--- 'Dependent.ObsEq.obsEqBy'.
+{- | Stuck closed type family representing the active plugin configuration
+('defaultObsConfig' overridden by any CLI @-fplugin-opt@ flags) inside
+'Dependent.ObsEq.obsEq', 'Dependent.ObsEq.obsEqOn', and
+'Dependent.ObsEq.obsEqBy'.
+-}
 type family DefaultObsConfig :: ObsConfig where
 
--- | Default observational-equivalence configuration (@obsTests = 100@,
--- @obsMaxSize = 20@, @obsApproxDepth = 100@, @obsPartialPct = 25@,
--- @obsTimeoutUs = 10000@, @obsSeed = 0@).
+{- | Default observational-equivalence configuration (@obsTests = 100@,
+@obsMaxSize = 20@, @obsApproxDepth = 100@, @obsPartialPct = 25@,
+@obsTimeoutUs = 10000@, @obsSeed = 0@).
+-}
 defaultObsConfig :: ObsConfig
 defaultObsConfig = ObsConfig 100 20 100 25 10000 0
 

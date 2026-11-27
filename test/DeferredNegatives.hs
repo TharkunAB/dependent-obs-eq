@@ -2,67 +2,67 @@
 {-# LANGUAGE DependentTypes #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ListTuplePuns #-}
-{-# OPTIONS_GHC -fplugin=Dependent.Plugin.ObsEq #-}
 {-# OPTIONS_GHC -fdefer-type-errors -Wno-deferred-type-errors #-}
+{-# OPTIONS_GHC -fplugin=Dependent.Plugin.ObsEq #-}
 
-module DeferredNegatives
-  ( badRootKeyCanon
-  , badEvenCallOdd
-  , badUnguardedSubset
-  , badNonSymRel
-  , badStrictByPartial
-  , badLoopTimeout
-  , badDepthCutoff
-  , badImpossibleGuard
-  , badParametricListRefuted
-  , badFalsePlusSwap
-  , badNearMissNat6
-  , badNearMissNat15
-  , badNearMissInt15
-  ) where
+module DeferredNegatives (
+    badRootKeyCanon,
+    badEvenCallOdd,
+    badUnguardedSubset,
+    badNonSymRel,
+    badStrictByPartial,
+    badLoopTimeout,
+    badDepthCutoff,
+    badImpossibleGuard,
+    badParametricListRefuted,
+    badFalsePlusSwap,
+    badNearMissNat6,
+    badNearMissNat15,
+    badNearMissInt15,
+) where
 
-import Data.Type.Equality ( (:~:) (Refl) )
-import Dependent.ObsEq
-  ( ObsEquivBy (..)
-  , checkObsEq
-  , checkObsEqBy
-  , defaultObsConfig
-  , forVar
-  , obsEqBy
-  , setApproxDepth
-  , setTests
-  , setTimeoutUs
-  , totalObsConfig
-  )
-import Defs
-  ( Nat (..)
-  , RBTree (..)
-  , deepNat12
-  , eqMod2Nat
-  , evenIntDomain
-  , evenNatDomain
-  , fromListRB
-  , isEvenInt
-  , isEvenNat
-  , isValidBST
-  , leNat
-  , loopNat
-  , nearMissInt15
-  , nearMissNat15
-  , nearMissNat6
-  , plus
-  , rbDomain
-  , rootKey
-  , toListRB
-  , twiceHalfNat
-  , unfoldPlus
-  )
+import Data.Type.Equality ((:~:) (Refl))
+import Defs (
+    Nat (..),
+    RBTree (..),
+    deepNat12,
+    eqMod2Nat,
+    evenIntDomain,
+    evenNatDomain,
+    fromListRB,
+    isEvenInt,
+    isEvenNat,
+    isValidBST,
+    leNat,
+    loopNat,
+    nearMissInt15,
+    nearMissNat15,
+    nearMissNat6,
+    plus,
+    rbDomain,
+    rootKey,
+    toListRB,
+    twiceHalfNat,
+    unfoldPlus,
+ )
+import Dependent.ObsEq (
+    ObsEquivBy (..),
+    checkObsEq,
+    checkObsEqBy,
+    defaultObsConfig,
+    forVar,
+    obsEqBy,
+    setApproxDepth,
+    setTests,
+    setTimeoutUs,
+    totalObsConfig,
+ )
 
 -- 1. Non-respectful observer 'rootKey' fails canonicalization even on valid BSTs.
-badRootKeyProof
-  :: foreach (t :: RBTree Nat)
-  -> (isValidBST t ~ True)
-  => rootKey (fromListRB (toListRB t)) :~: rootKey t
+badRootKeyProof ::
+    foreach (t :: RBTree Nat) ->
+    (isValidBST t ~ True) =>
+    rootKey (fromListRB (toListRB t)) :~: rootKey t
 badRootKeyProof t = checkObsEq (forVar t rbDomain (setTests 40 totalObsConfig))
 
 badRootKeyCanon :: rootKey (fromListRB (toListRB E)) :~: rootKey E
@@ -112,10 +112,10 @@ badDepthCutoff :: deepNat12 Zero :~: deepNat12 (Succ Zero)
 badDepthCutoff = badCutoffProof
 
 -- 7. Unsatisfiable Given guard (2*n ~ 1) hits InsufficientPreconditionHits -> Inconclusive!
-badInsuffProof
-  :: foreach (n :: Nat)
-  -> (plus n n ~ Succ Zero)
-  => unfoldPlus n Zero :~: n
+badInsuffProof ::
+    foreach (n :: Nat) ->
+    (plus n n ~ Succ Zero) =>
+    unfoldPlus n Zero :~: n
 badInsuffProof _n = checkObsEq (setTests 6 totalObsConfig)
 
 badImpossibleGuard :: ()
