@@ -21,6 +21,9 @@ module Defs
   , loopNat
   , spinAlloc
   , deepNat12
+  , nearMissNat6
+  , nearMissNat15
+  , nearMissInt15
   , Vec (..)
   , vToList
   , Color (..)
@@ -140,6 +143,32 @@ spinAlloc k
 deepNat12 :: Nat -> Nat
 deepNat12 n =
   Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ n)))))))))))
+
+-- | Agrees with identity on @0..5@ and collapses to 'Zero' at @>= 6@.
+nearMissNat6 :: Nat -> Nat
+nearMissNat6 Zero = Zero
+nearMissNat6 (Succ Zero) = Succ Zero
+nearMissNat6 (Succ (Succ Zero)) = Succ (Succ Zero)
+nearMissNat6 (Succ (Succ (Succ Zero))) = Succ (Succ (Succ Zero))
+nearMissNat6 (Succ (Succ (Succ (Succ Zero)))) = Succ (Succ (Succ (Succ Zero)))
+nearMissNat6 (Succ (Succ (Succ (Succ (Succ Zero))))) = Succ (Succ (Succ (Succ (Succ Zero))))
+nearMissNat6 _ = Zero
+
+natAtLeast15 :: Nat -> Bool
+natAtLeast15 (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ (Succ _))))))))))))))) = True
+natAtLeast15 _ = False
+
+-- | Agrees with identity on @0..14@ and collapses to 'Zero' at @>= 15@.
+nearMissNat15 :: Nat -> Nat
+nearMissNat15 n
+  | natAtLeast15 n = Zero
+  | otherwise = n
+
+-- | Agrees with identity on @[-14..14]@ and collapses to @0@ when @|n| >= 15@.
+nearMissInt15 :: Int -> Int
+nearMissInt15 n
+  | n >= (-14) && n <= 14 = n
+  | otherwise = 0
 
 -- ---------------------------------------------------------------------------
 -- Length-Indexed Vectors

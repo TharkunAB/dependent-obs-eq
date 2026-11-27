@@ -9,12 +9,15 @@ module Main (main, evenRoundtrip) where
 import Control.Exception ( TypeError (..), evaluate, try )
 import Data.List ( isInfixOf, isPrefixOf )
 import Data.Type.Equality ( (:~:) (Refl) )
+import GHC.Generics ( Generic )
 import Dependent.ObsEq
-  ( Gen
+  ( DefaultObsConfig
+  , Gen
   , GuardResult (..)
   , InconclusiveReason (..)
   , ObsCmp (..)
   , ObsConfig (..)
+  , ObsDomain
   , ObsEquivBy (..)
   , ObsEquivOn (..)
   , ObsGen (..)
@@ -26,6 +29,7 @@ import Dependent.ObsEq
   , checkObsEqOn
   , compareObsTree
   , defaultObsConfig
+  , domainVia
   , evalObsSample
   , forType
   , forVar
@@ -59,6 +63,9 @@ import DeferredNegatives
   , badFalsePlusSwap
   , badImpossibleGuard
   , badLoopTimeout
+  , badNearMissInt15
+  , badNearMissNat15
+  , badNearMissNat6
   , badNonSymRel
   , badParametricListRefuted
   , badRootKeyCanon
@@ -87,6 +94,9 @@ import Defs
   , isEvenNat
   , isValidBST
   , leNat
+  , nearMissInt15
+  , nearMissNat15
+  , nearMissNat6
   , plus
   , rbDomain
   , rootKey
@@ -110,6 +120,10 @@ totalCfg = setTests 80 totalObsConfig
 -- | Default 'obsEq' verifies lazy equivalence (including partial 'ObsBottom' spines).
 unfoldPlusCorrect :: foreach (m :: Nat) (n :: Nat) -> unfoldPlus m n :~: plus m n
 unfoldPlusCorrect _m _n = obsEq
+
+-- | Explicit witness call using re-exported 'DefaultObsConfig'.
+explicitDefaultCfgLaw :: foreach (m :: Nat) (n :: Nat) -> unfoldPlus m n :~: plus m n
+explicitDefaultCfgLaw _m _n = checkObsEq DefaultObsConfig
 
 -- | Multiple independent explicit goals in one module to exercise per-module
 -- desugar caching, De Bruijn GoalVerdictCache, and batched BCO evaluation.
@@ -172,6 +186,51 @@ evenRoundtrip n = checkObsEq (forVar n evenIntDomain totalObsConfig)
 
 evenNatRoundtrip :: foreach (n :: Nat) -> (isEvenNat n ~ True) => twiceHalfNat n :~: n
 evenNatRoundtrip n = checkObsEq (forVar n evenNatDomain totalObsConfig)
+
+-- Same-module datatype with 'deriving Generic' + 'instance ObsGen' + local functions
+-- and same-module 'ObsConfig' bindings inside 'forVar' and 'forType'.
+data LocalNat = LZero | LSucc LocalNat
+  deriving (Eq, Ord, Show, Generic)
+
+instance ObsGen LocalNat
+
+localIdNat :: LocalNat -> LocalNat
+localIdNat LZero = LZero
+localIdNat (LSucc n) = LSucc (localIdNat n)
+
+localDouble :: LocalNat -> LocalNat
+localDouble LZero = LZero
+localDouble (LSucc n) = LSucc (LSucc (localDouble n))
+
+localHalf :: LocalNat -> LocalNat
+localHalf LZero = LZero
+localHalf (LSucc LZero) = LZero
+localHalf (LSucc (LSucc n)) = LSucc (localHalf n)
+
+localIsEven :: LocalNat -> Bool
+localIsEven LZero = True
+localIsEven (LSucc n) = not (localIsEven n)
+
+localEvenDom :: ObsDomain LocalNat
+localEvenDom = domainVia localDouble localHalf
+
+localCfg40 :: ObsConfig
+localCfg40 = setTests 40 totalObsConfig
+
+localComputedCfg :: ObsConfig
+localComputedCfg = setTests (20 + 20) totalObsConfig
+
+sameModGenericId :: foreach (n :: LocalNat) -> localIdNat n :~: n
+sameModGenericId _n = checkObsEq totalObsConfig
+
+sameModForVarCfg :: foreach (n :: LocalNat) -> (localIsEven n ~ True) => localDouble (localHalf n) :~: n
+sameModForVarCfg n = checkObsEq (forVar n localEvenDom localCfg40)
+
+sameModForTypeCfg :: foreach (n :: LocalNat) -> (localIsEven n ~ True) => localDouble (localHalf n) :~: n
+sameModForTypeCfg _n = checkObsEq (forType localEvenDom localCfg40)
+
+sameModForVarComputedCfg :: foreach (n :: LocalNat) -> (localIsEven n ~ True) => localDouble (localHalf n) :~: n
+sameModForVarComputedCfg n = checkObsEq (forVar n localEvenDom localComputedCfg)
 
 validEmptyBST :: foreach (t :: RBTree Nat) -> (t ~ E) => isValidBST t :~: True
 validEmptyBST _t = checkObsEq totalObsConfig
@@ -313,10 +372,16 @@ main = do
   -- 1b. Batched BCO & GoalVerdictCache witnesses
   () <- case (batchLaw1 twoNat oneNat, batchLaw2 oneNat twoNat, batchLaw3 twoNat) of
     (Refl, Refl, Refl) -> pure ()
+  () <- case explicitDefaultCfgLaw twoNat oneNat of Refl -> pure ()
 
-  -- 2. Collatz & guarded evenRoundtrip
+  -- 2. Collatz, guarded evenRoundtrip, and same-module Generic/forVar/forType regressions
   () <- case collatzConverges twoNat of Refl -> pure ()
   () <- case evenNatRoundtrip (Succ (Succ Zero)) of Refl -> pure ()
+  let twoLocal = LSucc (LSucc LZero)
+  () <- case sameModGenericId twoLocal of Refl -> pure ()
+  () <- case sameModForVarCfg twoLocal of Refl -> pure ()
+  () <- case sameModForTypeCfg twoLocal of Refl -> pure ()
+  () <- case sameModForVarComputedCfg twoLocal of Refl -> pure ()
 
   -- 3. Constructive KBO proofs (both ExplicitOnly and RefuteOnly!)
   () <- case accPlusCorrect twoNat oneNat of
@@ -354,7 +419,52 @@ main = do
   assertDeferredTypeError "badImpossibleGuard" badImpossibleGuard
   assertDeferredTypeError "badParametricListRefuted" badParametricListRefuted
   assertDeferredTypeError "badFalsePlusSwap" badFalsePlusSwap
+  assertDeferredTypeError "badNearMissNat6" badNearMissNat6
+  assertDeferredTypeError "badNearMissNat15" badNearMissNat15
+  assertDeferredTypeError "badNearMissInt15" (badNearMissInt15 0)
   assertDeferredTypeError "badExplicitUnderRefuteOnly" badExplicitUnderRefuteOnly
+
+  -- 6b. Verify near-miss laws are genuinely REFUTED ("FAIL:") with counterexamples, not Inconclusive
+  nat6Out <-
+    runObsTestLoop
+      totalObsConfig
+      Nothing
+      (const (pure GuardHolds))
+      obsGenPartial
+      obsShrink
+      (\n -> "n = " ++ obsShow n)
+      obsApprox
+      nearMissNat6
+      id
+  assert ("nearMissNat6 refuted, got: " ++ nat6Out) ("FAIL:" `isPrefixOf` nat6Out)
+
+  nat15Out <-
+    runObsTestLoop
+      totalObsConfig
+      Nothing
+      (const (pure GuardHolds))
+      obsGenPartial
+      obsShrink
+      (\n -> "n = " ++ obsShow n)
+      obsApprox
+      nearMissNat15
+      id
+  assert ("nearMissNat15 refuted, got: " ++ nat15Out) ("FAIL:" `isPrefixOf` nat15Out)
+
+  int15Out <-
+    runObsTestLoop
+      totalObsConfig
+      Nothing
+      (const (pure GuardHolds))
+      obsGenPartial
+      obsShrink
+      (\n -> "n = " ++ obsShow n)
+      obsApprox
+      nearMissInt15
+      id
+  assert
+    ("nearMissInt15 refuted and shrunk to +-15, got: " ++ int15Out)
+    ("FAIL:" `isPrefixOf` int15Out && ("n = 15 " `isInfixOf` int15Out || "n = -15 " `isInfixOf` int15Out))
 
   -- 7. Direct runtime verification of Kleene lattice, coupled shrinking, and diagnostics
   assert

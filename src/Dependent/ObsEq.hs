@@ -51,6 +51,7 @@ module Dependent.ObsEq
       , obsTimeoutUs
       , obsSeed
       )
+  , DefaultObsConfig
   , defaultObsConfig
   , totalObsConfig
   , setTests

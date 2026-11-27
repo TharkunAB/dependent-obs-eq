@@ -88,6 +88,7 @@ module Dependent.ObsEq.Domain (
     obsAndGuard,
     obsPureGen,
     obsApGen,
+    obsApHalfGen,
     obsPureIO,
     obsBindIO,
     obsAppendStr,
@@ -258,10 +259,20 @@ frequency pairs =
                     go _ [] = error "Dependent.ObsEq.frequency: unreachable"
                 go pick pos
 
--- | Generate a list whose length scales up to the active size.
+{- | Generate a list whose length scales up to the active size.
+See Note [Linear size stratification and non-geometric constructor choice].
+-}
 listOf :: Gen a -> Gen [a]
 listOf g = sized $ \sz -> do
-    len <- chooseInt (0, sz)
+    len <-
+        if sz <= 0
+            then pure 0
+            else
+                frequency
+                    [ (1, pure sz)
+                    , (2, chooseInt (max 1 (sz `quot` 2), sz))
+                    , (1, chooseInt (0, sz))
+                    ]
     let build 0 = pure []
         build k = (:) <$> resize (sz `quot` 2) g <*> build (k - 1)
     build len
@@ -528,7 +539,7 @@ evalSideFingerprints cfg mkEnvGen approxR evalSide = do
             let sz = sampleScheduleSize idx 8 maxSz
                 usePartial = partPct > 0 && idx >= 5 && ((idx * 37 + 13) `rem` 100 < partPct)
                 baseGen = if usePartial then partialGen else totalGen
-                env = runGenAt seed0 idx sz (applyAxisProbe idx sz baseGen)
+                env = runGenAt seed0 idx sz baseGen
             t <- evalObsSample tmoUs approxR 4 (evalSide env)
             pure (hashObsTree t)
     hashes <- mapM probeOne [0 .. 7]
@@ -757,16 +768,28 @@ instance ObsGen Int where
         if sz <= 0
             then pure 0
             else
-                if sz <= 4
-                    then frequency [(1, elements [0, 1, -1, 2, -2]), (3, chooseInt (-sz, sz))]
-                    else chooseInt (-sz, sz)
+                let half = max 1 (sz `quot` 2)
+                 in frequency
+                        [ (1, elements [-sz, sz])
+                        , (2, oneof [chooseInt (-sz, -half), chooseInt (half, sz)])
+                        , (1, chooseInt (-sz, sz))
+                        ]
     obsGenPartial pct = mixPartial pct obsGen
     obsShrink = shrinkIntegral
     obsApprox = obsScalarApprox
     obsShow = obsSafeShowScalar
 
 instance ObsGen Word where
-    obsGen = sized $ \sz -> fromIntegral <$> chooseInt (0, max 0 sz)
+    obsGen = sized $ \sz ->
+        if sz <= 0
+            then pure 0
+            else
+                let half = max 1 (sz `quot` 2)
+                 in frequency
+                        [ (1, pure (fromIntegral sz))
+                        , (2, fromIntegral <$> chooseInt (half, sz))
+                        , (1, fromIntegral <$> chooseInt (0, sz))
+                        ]
     obsGenPartial pct = mixPartial pct obsGen
     obsShrink 0 = []
     obsShrink w = 0 : [w - d | d <- takeWhile (> 0) (iterate (`quot` 2) w), w - d /= w, w - d /= 0]
@@ -774,14 +797,33 @@ instance ObsGen Word where
     obsShow = obsSafeShowScalar
 
 instance ObsGen Integer where
-    obsGen = sized $ \sz -> chooseInteger (negate (fromIntegral sz), fromIntegral sz)
+    obsGen = sized $ \sz ->
+        if sz <= 0
+            then pure 0
+            else
+                let s = fromIntegral sz :: Integer
+                    half = max 1 (s `quot` 2)
+                 in frequency
+                        [ (1, elements [-s, s])
+                        , (2, oneof [chooseInteger (-s, -half), chooseInteger (half, s)])
+                        , (1, chooseInteger (-s, s))
+                        ]
     obsGenPartial pct = mixPartial pct obsGen
     obsShrink = shrinkIntegral
     obsApprox = obsScalarApprox
     obsShow = obsSafeShowScalar
 
 instance ObsGen Natural where
-    obsGen = sized $ \sz -> fromIntegral <$> chooseInt (0, max 0 sz)
+    obsGen = sized $ \sz ->
+        if sz <= 0
+            then pure 0
+            else
+                let half = max 1 (sz `quot` 2)
+                 in frequency
+                        [ (1, pure (fromIntegral sz))
+                        , (2, fromIntegral <$> chooseInt (half, sz))
+                        , (1, fromIntegral <$> chooseInt (0, sz))
+                        ]
     obsGenPartial pct = mixPartial pct obsGen
     obsShrink 0 = []
     obsShrink n = 0 : [n - d | d <- takeWhile (> 0) (iterate (`quot` 2) n), d <= n, n - d /= n, n - d /= 0]
@@ -792,13 +834,13 @@ instance (ObsGen a) => ObsGen (Maybe a) where
     obsGen = sized $ \sz ->
         if sz <= 0
             then pure Nothing
-            else frequency [(1, pure Nothing), (3, Just <$> resize (sz - 1) obsGen)]
+            else frequency [(1, pure Nothing), (max 3 (2 * sz), Just <$> resize (sz - 1) obsGen)]
     obsGenPartial pct =
         mixPartial pct $
             sized $ \sz ->
                 if sz <= 0
                     then pure Nothing
-                    else frequency [(1, pure Nothing), (3, Just <$> resize (sz - 1) (obsGenPartial pct))]
+                    else frequency [(1, pure Nothing), (max 3 (2 * sz), Just <$> resize (sz - 1) (obsGenPartial pct))]
     obsShrink Nothing = []
     obsShrink (Just x) = Nothing : map Just (obsShrink x)
     obsApprox depth mx
@@ -931,16 +973,18 @@ instance (ObsGen a, ObsGen b, ObsGen c) => ObsGen (a, b, c) where
 
 instance (ObsGen a) => ObsGen [a] where
     obsGen = listOf obsGen
-    obsGenPartial pct =
-        mixPartial pct $
-            sized $ \sz ->
-                if sz <= 0
-                    then pure []
-                    else
-                        frequency
-                            [ (2, pure [])
-                            , (5, (:) <$> resize (sz `quot` 2) (obsGenPartial pct) <*> resize (sz - 1) (obsGenPartial pct))
-                            ]
+    obsGenPartial pct
+        | pct <= 0 = obsGen
+        | otherwise =
+            mixPartial pct $
+                sized $ \sz ->
+                    if sz <= 0
+                        then pure []
+                        else
+                            frequency
+                                [ (1, pure [])
+                                , (4 * sz, (:) <$> resize (sz `quot` 2) (obsGenPartial pct) <*> resize (sz - 1) (obsGenPartial pct))
+                                ]
     obsShrink xs =
         case safeUncons xs of
             Just (y, ys) ->
@@ -996,45 +1040,101 @@ instance (ObsGen a) => ObsGen [a] where
 -- Generic Derivation Helpers for User Algebraic Datatypes
 -- ---------------------------------------------------------------------------
 
+{- Note [Linear size stratification and non-geometric constructor choice]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unweighted choice between nullary and recursive constructors at every sum node
+(@oneof [L1 ..., R1 ...]@) samples unary recursive types such as Peano @Nat@
+from a @Geometric(1/2)@ distribution (@P(n >= k) = 2^(-k)@), independent of the
+active generator size @sz@. Combined with a concave size schedule, values near
+@obsMaxSize@ are practically unreachable and false equations that hold only on
+small inputs can pass bounded testing.
+
+To sample values across the full @[0 .. obsMaxSize]@ range without exponential
+blowup on branching trees:
+
+1. 'GObsGen' and 'mkAdtObsDict' collect nullary base constructors separately
+   from non-nullary constructors ('chooseSumBranches'). When @sz <= 0@, only
+   base constructors run. When @sz > 0@, non-nullary constructors receive weight
+   @4 * sz@ against weight @1@ for base constructors, so a unary chain reaches
+   full depth @sz@ with probability @prod_{k=1..sz} 4k / (4k + 1)@ (~41% at
+   @sz = 20@) while still visiting intermediate depths for multi-variable goals.
+2. Multi-field products ('splitProductSize' and 'obsApHalfGen') conserve the
+   node budget across child fields so total constructor count stays @O(sz)@.
+3. 'sampleScheduleSize' stratifies @idx = 0 .. nTests - 1@ linearly across
+   @[0 .. maxSz]@, and scalar generators ('Int', 'Word', 'Integer', 'Natural')
+   mix exact @+-sz@ boundaries, the upper shell @[sz/2 .. sz]@, and @[-sz .. sz]@.
+-}
+
+splitProductSize :: Int -> Gen (Int, Int)
+splitProductSize sz
+    | sz <= 1 = pure (0, 0)
+    | otherwise = do
+        mode <- chooseInt (0, 1)
+        if mode == 0
+            then let half = sz `quot` 2 in pure (half, sz - half)
+            else do
+                k <- chooseInt (0, sz)
+                pure (k, sz - k)
+
+chooseSumBranches :: Int -> [Gen a] -> [Gen a] -> Gen a
+chooseSumBranches sz bases recs
+    | null recs = oneof bases
+    | null bases = oneof recs
+    | sz <= 0 = oneof bases
+    | otherwise = frequency [(1, oneof bases), (4 * sz, oneof recs)]
+
 class GObsGen f where
     gObsGen :: Gen (f p)
     gObsGenPartial :: Int -> Gen (f p)
     gNullaryBranches :: [Gen (f p)]
+    gCompoundBranches :: [Gen (f p)]
+    gCompoundBranchesPartial :: Int -> [Gen (f p)]
 
 instance (GObsGen f) => GObsGen (M1 i c f) where
     gObsGen = M1 <$> gObsGen
     gObsGenPartial pct = M1 <$> gObsGenPartial pct
     gNullaryBranches = map (fmap M1) gNullaryBranches
+    gCompoundBranches = map (fmap M1) gCompoundBranches
+    gCompoundBranchesPartial pct = map (fmap M1) (gCompoundBranchesPartial pct)
 
 instance GObsGen U1 where
     gObsGen = pure U1
     gObsGenPartial _ = pure U1
     gNullaryBranches = [pure U1]
+    gCompoundBranches = []
+    gCompoundBranchesPartial _ = []
 
 instance (ObsGen c) => GObsGen (K1 i c) where
     gObsGen = K1 <$> sized (\sz -> resize (max 0 (sz - 1)) obsGen)
     gObsGenPartial pct = K1 <$> sized (\sz -> resize (max 0 (sz - 1)) (obsGenPartial pct))
     gNullaryBranches = []
+    gCompoundBranches = [gObsGen]
+    gCompoundBranchesPartial pct = [gObsGenPartial pct]
 
 instance (GObsGen a, GObsGen b) => GObsGen (a :*: b) where
-    gObsGen = sized $ \sz ->
-        (:*:) <$> resize (sz `quot` 2) gObsGen <*> resize (sz `quot` 2) gObsGen
-    gObsGenPartial pct = sized $ \sz ->
-        (:*:) <$> resize (sz `quot` 2) (gObsGenPartial pct) <*> resize (sz `quot` 2) (gObsGenPartial pct)
+    gObsGen = sized $ \sz -> do
+        (szL, szR) <- splitProductSize sz
+        (:*:) <$> resize szL gObsGen <*> resize szR gObsGen
+    gObsGenPartial pct = sized $ \sz -> do
+        (szL, szR) <- splitProductSize sz
+        (:*:) <$> resize szL (gObsGenPartial pct) <*> resize szR (gObsGenPartial pct)
     gNullaryBranches = []
+    gCompoundBranches = [gObsGen]
+    gCompoundBranchesPartial pct = [gObsGenPartial pct]
 
 instance (GObsGen a, GObsGen b) => GObsGen (a :+: b) where
     gObsGen = sized $ \sz ->
         let bases = map (fmap L1) gNullaryBranches ++ map (fmap R1) gNullaryBranches
-         in if sz <= 0 && not (null bases)
-                then oneof bases
-                else oneof [L1 <$> gObsGen, R1 <$> gObsGen]
+            recs = map (fmap L1) gCompoundBranches ++ map (fmap R1) gCompoundBranches
+         in chooseSumBranches sz bases recs
     gObsGenPartial pct = sized $ \sz ->
         let bases = map (fmap L1) gNullaryBranches ++ map (fmap R1) gNullaryBranches
-         in if sz <= 0 && not (null bases)
-                then oneof bases
-                else oneof [L1 <$> gObsGenPartial pct, R1 <$> gObsGenPartial pct]
+            recs = map (fmap L1) (gCompoundBranchesPartial pct) ++ map (fmap R1) (gCompoundBranchesPartial pct)
+         in chooseSumBranches sz bases recs
     gNullaryBranches = map (fmap L1) gNullaryBranches ++ map (fmap R1) gNullaryBranches
+    gCompoundBranches = map (fmap L1) gCompoundBranches ++ map (fmap R1) gCompoundBranches
+    gCompoundBranchesPartial pct =
+        map (fmap L1) (gCompoundBranchesPartial pct) ++ map (fmap R1) (gCompoundBranchesPartial pct)
 
 class GObsShrink f where
     gObsShrink :: f p -> [f p]
@@ -1136,26 +1236,16 @@ mkAdtObsDict baseGens totalCons partialCons rawShrink rawApprox rawShow =
     AdtObsDict genTotal genPart safeShrink approxFn showFn
   where
     genTotal = sized $ \sz ->
-        if sz <= 0 && not (null baseGens)
-            then oneof baseGens
-            else
-                let stepSz = max 0 (sz - 1)
-                    allBranches = map (resize stepSz . ($ stepSz)) totalCons
-                 in if null baseGens
-                        then oneof allBranches
-                        else frequency [(1, oneof baseGens), (3, oneof allBranches)]
+        let stepSz = max 0 (sz - 1)
+            allBranches = map (resize stepSz . ($ stepSz)) totalCons
+         in chooseSumBranches sz baseGens allBranches
 
     genPart pct =
         mixPartial pct $
             sized $ \sz ->
-                if sz <= 0 && not (null baseGens)
-                    then oneof baseGens
-                    else
-                        let stepSz = max 0 (sz - 1)
-                            allBranches = map (\f -> resize stepSz (f pct stepSz)) partialCons
-                         in if null baseGens
-                                then oneof allBranches
-                                else frequency [(1, oneof baseGens), (3, oneof allBranches)]
+                let stepSz = max 0 (sz - 1)
+                    allBranches = map (\f -> resize stepSz (f pct stepSz)) partialCons
+                 in chooseSumBranches sz baseGens allBranches
 
     safeShrink x =
         System.IO.Unsafe.unsafePerformIO $
@@ -1356,8 +1446,7 @@ evalObsVerdictFull cfg mbBaseline checkGuard mkEnvGen shrinkEnv approxR evalLhs 
             | otherwise = do
                 let sz = sampleScheduleSize passed nTests maxSz
                     usePartial = partPct > 0 && passed >= 5 && ((attempts * 37 + 13) `rem` 100 < partPct)
-                    baseGen = if usePartial then partialGen else totalGen
-                    chosenGen = applyAxisProbe passed sz baseGen
+                    chosenGen = if usePartial then partialGen else totalGen
                     env = runGenAt seed0 attempts sz chosenGen
                 gRes <- checkGuard env
                 case gRes of
@@ -1404,39 +1493,15 @@ safeShrinkTake limit shrinkFn cur = step limit (shrinkFn cur)
             Just (Just (y, ys)) -> (y :) <$> step (k - 1) ys
             _ -> pure []
 
+-- See Note [Linear size stratification and non-geometric constructor choice].
 sampleScheduleSize :: Int -> Int -> Int -> Int
 sampleScheduleSize idx nTests maxSz
     | maxSz <= 0 = 0
     | nTests <= 1 = maxSz
-    | idx == 0 = 0
-    | idx <= 2 = min maxSz 1
-    | idx <= 4 = min maxSz 2
-    | idx <= 7 = min maxSz 3
-    | idx == nTests - 1 = maxSz
-    | otherwise =
-        let remN = max 1 (nTests - 8)
-            k = idx - 8
-            spanCube = toInteger maxSz * toInteger maxSz * toInteger maxSz
-            u = (toInteger (remN - 1 - k) * spanCube) `quot` toInteger remN
-            r = integerCubeRoot u
-         in max 1 (min maxSz (maxSz - fromIntegral r))
-
-integerCubeRoot :: Integer -> Integer
-integerCubeRoot n
-    | n <= 0 = 0
-    | otherwise = go n
-  where
-    go x =
-        let x' = (2 * x + (n `quot` (x * x))) `quot` 3
-         in if x' >= x then x else go x'
-
-applyAxisProbe :: Int -> Int -> Gen a -> Gen a
-applyAxisProbe idx sz (Gen g)
-    | idx >= 1 && idx <= 4 = Gen $ \s _ ->
-        let (_, s2) = splitSeed s
-            probeSz = if even idx then max 1 sz else 0
-         in g s2 probeSz
-    | otherwise = Gen g
+    | idx <= 0 = 0
+    | idx >= nTests - 1 = maxSz
+    | nTests <= maxSz = (idx * maxSz) `quot` (nTests - 1)
+    | otherwise = min maxSz ((idx * (maxSz + 1)) `quot` nTests)
 
 formatRefuted :: (env -> String) -> String -> String -> Int -> Int -> env -> ObsTree -> ObsTree -> String
 formatRefuted showEnv lhsLabel rhsLabel sampleNum shrunkSteps minEnv minL minR =
@@ -1680,7 +1745,7 @@ runObsByLoop cfg mbBase checkGuard mkEnvGen shrinkEnv showEnv relName relFn eval
                 let sz = sampleScheduleSize passed nTests maxSz
                     usePartial = partPct > 0 && passed >= 5 && ((attempts * 37 + 13) `rem` 100 < partPct)
                     baseGen = if usePartial then partialGen else totalGen
-                    env = runGenAt seed0 attempts sz (applyAxisProbe passed sz baseGen)
+                    env = runGenAt seed0 attempts sz baseGen
                 gRes <- checkGuard env
                 case gRes of
                     GuardFails -> loop passed (attempts + 1) mbUnk
@@ -1714,6 +1779,10 @@ obsPureGen = pure
 obsApGen :: Gen (a -> b) -> Gen a -> Gen b
 obsApGen = (<*>)
 
+-- | Apply a constructor generator to a branching field generator at half size.
+obsApHalfGen :: Gen (a -> b) -> Gen a -> Gen b
+obsApHalfGen gf gx = gf <*> sized (\sz -> resize (sz `quot` 2) gx)
+
 -- | Unconstrained 'pure' for 'IO', used by plugin Core synthesis.
 obsPureIO :: a -> IO a
 obsPureIO = pure
@@ -1735,17 +1804,21 @@ obsMapList :: (a -> b) -> [a] -> [b]
 obsMapList = map
 
 {- | Combine two partiality-parameterized generators into a pair generator
-with axis-isolated Tier-0 boundary splits.
+with axis-isolated boundary splits and full-size axis probes.
 -}
 obsPairGen :: (Int -> Gen a) -> (Int -> Gen b) -> Int -> Gen (a, b)
 obsPairGen ga gb pct = Gen $ \s sz ->
     let (s0, sRest) = splitSeed s
         (s1, s2) = splitSeed sRest
         (w, _) = stepSeed s0
-        (szA, szB)
-            | sz <= 2 && (w .&. 3 == 1) = (sz, 0)
-            | sz <= 2 && (w .&. 3 == 2) = (0, sz)
-            | otherwise = (sz `quot` 2, sz `quot` 2)
+        half = sz `quot` 2
+        (szA, szB) =
+            case w .&. 7 of
+                1 -> (sz, 0)
+                2 -> (0, sz)
+                3 -> (sz, half)
+                4 -> (half, sz)
+                _ -> (half, sz - half)
      in (unGen (ga pct) s1 szA, unGen (gb pct) s2 szB)
 
 {- | Combine two component shrinkers into a pair shrinker with a bounded

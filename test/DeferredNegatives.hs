@@ -16,6 +16,9 @@ module DeferredNegatives
   , badImpossibleGuard
   , badParametricListRefuted
   , badFalsePlusSwap
+  , badNearMissNat6
+  , badNearMissNat15
+  , badNearMissInt15
   ) where
 
 import Data.Type.Equality ( (:~:) (Refl) )
@@ -44,6 +47,9 @@ import Defs
   , isValidBST
   , leNat
   , loopNat
+  , nearMissInt15
+  , nearMissNat15
+  , nearMissNat6
   , plus
   , rbDomain
   , rootKey
@@ -128,3 +134,22 @@ badFalsePlusProof _m = Refl
 
 badFalsePlusSwap :: plus Zero (Succ Zero) :~: Zero
 badFalsePlusSwap = badFalsePlusProof Zero
+
+-- 10. Near-miss Peano and Int equations at depths 6 and 15 are refuted under totalObsConfig.
+badNearMissNat6Proof :: foreach (n :: Nat) -> nearMissNat6 n :~: n
+badNearMissNat6Proof _n = checkObsEq totalObsConfig
+
+badNearMissNat6 :: nearMissNat6 Zero :~: Zero
+badNearMissNat6 = badNearMissNat6Proof Zero
+
+badNearMissNat15Proof :: foreach (n :: Nat) -> nearMissNat15 n :~: n
+badNearMissNat15Proof _n = checkObsEq totalObsConfig
+
+badNearMissNat15 :: nearMissNat15 Zero :~: Zero
+badNearMissNat15 = badNearMissNat15Proof Zero
+
+badNearMissInt15Proof :: foreach (n :: Int) -> nearMissInt15 n :~: n
+badNearMissInt15Proof _n = checkObsEq totalObsConfig
+
+badNearMissInt15 :: Int -> ()
+badNearMissInt15 n = case badNearMissInt15Proof n of Refl -> ()
